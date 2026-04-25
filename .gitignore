@@ -6,3 +6,5 @@ __pycache__/
 .chainlit/
 smoketest.py
 .DS_Store
+.claude/
+.pytest_cache/
