@@ -5,7 +5,7 @@ import pytest
 
 from agent.chart_directive import detect
 from agent.nodes import generate_chart
-from agent.state import ChartSpec
+from agent.state import ChartCode
 
 
 # ---------- detector: skip patterns win over force ----------
@@ -82,37 +82,25 @@ def test_skip_directive_returns_none_without_calling_llm():
     picker.assert_not_called()
 
 
-def test_force_directive_overrides_llm_none():
-    """User asked for a chart, LLM said 'none' — we must still produce a chart."""
-    rows = [{"title": "a", "count": 1}, {"title": "b", "count": 2}]
-    spec = ChartSpec(kind="none", reasoning="(LLM declined)")
-    picker = MagicMock()
-    picker.invoke.return_value = spec
-    with patch("agent.nodes._chart_picker", return_value=picker):
-        out = generate_chart(_state("Plot this", rows))
-    assert out["chart"] is not None
-    assert out["chart"].kind == "bar"
-    assert out["chart"].y == "count"
-
-
 def test_force_directive_passes_force_note_in_prompt():
     rows = [{"title": "a", "count": 1}, {"title": "b", "count": 2}]
-    spec = ChartSpec(kind="bar", x="title", y="count", title="Counts")
+    chart = ChartCode(reasoning="x", code="fig = px.bar(df, x='title', y='count')",
+                      title="Counts")
     picker = MagicMock()
-    picker.invoke.return_value = spec
+    picker.invoke.return_value = chart
     with patch("agent.nodes._chart_picker", return_value=picker):
         generate_chart(_state("Show me a bar chart of films", rows))
     msgs = picker.invoke.call_args.args[0]
     user_content = next(m for m in msgs if m["role"] == "user")["content"]
     assert "explicitly asked for a chart" in user_content
-    assert 'MUST pick "bar"' in user_content
 
 
 def test_auto_directive_no_force_note_in_prompt():
     rows = [{"title": "a", "count": 1}, {"title": "b", "count": 2}]
-    spec = ChartSpec(kind="bar", x="title", y="count", title="Counts")
+    chart = ChartCode(reasoning="x", code="fig = px.bar(df, x='title', y='count')",
+                      title="Counts")
     picker = MagicMock()
-    picker.invoke.return_value = spec
+    picker.invoke.return_value = chart
     with patch("agent.nodes._chart_picker", return_value=picker):
         generate_chart(_state("Top films", rows))
     msgs = picker.invoke.call_args.args[0]
@@ -123,34 +111,12 @@ def test_auto_directive_no_force_note_in_prompt():
 def test_force_directive_overrides_single_row_skip():
     """auto-mode skips single-row results; force-mode still asks the LLM."""
     rows = [{"metric": "active_customers", "value": 599}]
-    spec = ChartSpec(kind="bar", x="metric", y="value", title="One value")
+    chart = ChartCode(reasoning="x", code="fig = px.bar(df, x='metric', y='value')",
+                      title="One value")
     picker = MagicMock()
-    picker.invoke.return_value = spec
+    picker.invoke.return_value = chart
     with patch("agent.nodes._chart_picker", return_value=picker):
         out = generate_chart(_state("Plot active customers", rows))
     picker.invoke.assert_called_once()
     assert out["chart"] is not None
-
-
-def test_force_directive_with_invalid_columns_falls_back_to_default():
-    rows = [{"title": "a", "count": 1}, {"title": "b", "count": 2}]
-    spec = ChartSpec(kind="bar", x="bogus", y="alsobogus", title="Bad")
-    picker = MagicMock()
-    picker.invoke.return_value = spec
-    with patch("agent.nodes._chart_picker", return_value=picker):
-        out = generate_chart(_state("Plot this", rows))
-    assert out["chart"] is not None
-    # Default spec uses real columns
-    assert out["chart"].x in ("title", "count")
-    assert out["chart"].y in ("title", "count")
-
-
-def test_auto_directive_with_invalid_columns_returns_none():
-    """Same scenario as above but no force directive — should bail out."""
-    rows = [{"title": "a", "count": 1}, {"title": "b", "count": 2}]
-    spec = ChartSpec(kind="bar", x="bogus", y="alsobogus", title="Bad")
-    picker = MagicMock()
-    picker.invoke.return_value = spec
-    with patch("agent.nodes._chart_picker", return_value=picker):
-        out = generate_chart(_state("Top films", rows))
-    assert out == {"chart": None}
+    assert out["chart"].code

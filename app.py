@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 from dotenv import load_dotenv
 load_dotenv()  # must come before any imports that read env vars
@@ -8,9 +9,12 @@ import pandas as pd
 import plotly.express as px
 from langchain_core.messages import HumanMessage
 
+logger = logging.getLogger(__name__)
+
 from agent.db import warmup
 from agent.graph import app_graph
-from agent.state import ChartSpec, turn_input
+from agent.chart_sandbox import SandboxError, execute_chart_code
+from agent.state import ChartCode, turn_input
 
 warmup()
 
@@ -48,30 +52,45 @@ def _format_rows_table(rows: list[dict]) -> str:
 #      If you skip this, the generic fallback renders the state-update fields
 #      as a key/value list — informative but unstyled.
 NODE_LABEL = {
-    "front_agent":    "Understanding the question",
-    "generate_sql":   "Generating SQL",
-    "validate_sql":   "Validating query",
-    "execute_sql":    "Executing on Postgres",
-    "diagnose_empty": "Investigating empty result",
-    "generate_chart": "Designing chart",
+    "front_agent":      "Understanding the question",
+    "generate_sql":     "Generating SQL",
+    "validate_sql":     "Validating query",
+    "execute_sql":      "Executing on Postgres",
+    "diagnose_empty":   "Investigating empty result",
+    "generate_chart":   "Designing chart",
+    "plan_report":      "Planning report sections",
+    "sub_query":        "Section query",
+    # aggregate_report is excluded — its prose IS the streaming message.
 }
 
 NODE_ICON = {
-    "front_agent":    "brain",
-    "generate_sql":   "code-2",
-    "validate_sql":   "shield-check",
-    "execute_sql":    "database",
-    "diagnose_empty": "search-check",
-    "generate_chart": "chart-bar",
+    "front_agent":      "brain",
+    "generate_sql":     "code-2",
+    "validate_sql":     "shield-check",
+    "execute_sql":      "database",
+    "diagnose_empty":   "search-check",
+    "generate_chart":   "chart-bar",
+    "plan_report":      "list-checks",
+    "sub_query":        "file-search",
 }
 
 
 def _step_body(node: str, output: dict) -> str:
     if node == "front_agent":
-        if output.get("intent") == "data":
+        intent = output.get("intent")
+        if intent == "data":
             dq = output.get("data_question") or "(none)"
-            return f"_Refined as:_\n\n> {dq}"
-        return "_Direct reply — no SQL needed._"
+            return f"_Refined as a data question:_\n\n> {dq}"
+        if intent == "rechart":
+            kind = output.get("chart_kind_override") or "(picker decides)"
+            return f"_Re-charting prior result. Requested kind: `{kind}`._"
+        if intent == "report":
+            return "_Routed to report generation — planning multi-section report._"
+        # respond — either a deterministic refusal (summary already set) or a
+        # routing-only decision that generate_response will fill in.
+        if output.get("summary"):
+            return "_Routed to direct reply (refused at the safety gate)._"
+        return "_Routed to direct reply — no SQL needed._"
     if node == "generate_sql":
         sql = output.get("sql") or "(no SQL produced)"
         return f"```sql\n{sql}\n```"
@@ -91,8 +110,45 @@ def _step_body(node: str, output: dict) -> str:
         return _diagnose_step_body(output)
     if node == "generate_chart":
         return _chart_step_body(output.get("chart"))
+    if node == "plan_report":
+        return _plan_report_step_body(output)
+    if node == "sub_query":
+        return _sub_query_step_body(output)
     # Fallback for any node added to NODE_LABEL without a custom branch above.
     return _generic_step_body(output)
+
+
+def _plan_report_step_body(output: dict) -> str:
+    """Step body for plan_report — show the planned outline + rationale."""
+    outline = output.get("report_outline") or []
+    rationale = output.get("report_plan_rationale") or ""
+    if not outline:
+        return "_No plan produced._"
+    lines = [f"_{rationale}_", "", f"**{len(outline)} sections planned:**", ""]
+    for i, section in enumerate(outline, 1):
+        # ReportSection objects — access fields directly
+        title = getattr(section, "title", "(untitled)")
+        sub_q = getattr(section, "sub_question", "")
+        hint = getattr(section, "chart_hint", None)
+        hint_str = f" · `{hint}`" if hint else ""
+        lines.append(f"{i}. **{title}**{hint_str} — {sub_q}")
+    return "\n".join(lines)
+
+
+def _sub_query_step_body(output: dict) -> str:
+    """Step body for sub_query — show the section's outcome compactly."""
+    sections = output.get("report_sections") or []
+    if not sections:
+        return "_(no section produced)_"
+    s = sections[0]  # each sub_query appends exactly one
+    title = getattr(s, "title", "(untitled)")
+    if getattr(s, "error", None):
+        return f"**{title}** — ❌ {s.error}"
+    sql = getattr(s, "sql", None) or "(no SQL)"
+    row_count = getattr(s, "row_count", 0)
+    summary = getattr(s, "summary", None) or "(no summary)"
+    body = f"**{title}** — {row_count} row(s)\n\n_{summary}_\n\n```sql\n{sql}\n```"
+    return body
 
 
 def _diagnose_step_body(output: dict) -> str:
@@ -145,14 +201,14 @@ def _chart_step_body(chart) -> str:
     """Markdown body for the generate_chart Step."""
     if chart is None:
         return "_No chart for this result._"
-    lines = [f"**{chart.kind.title()} chart**"]
+    lines = []
     if chart.title:
-        lines.append(f"_{chart.title}_")
-    if chart.x and chart.y:
-        lines.append(f"x = `{chart.x}`  ·  y = `{chart.y}`")
+        lines.append(f"**{chart.title}**")
     if chart.reasoning:
-        lines.append(chart.reasoning)
-    return "\n\n".join(lines)
+        lines.append(f"_{chart.reasoning}_")
+    if chart.code:
+        lines.append(f"```python\n{chart.code}\n```")
+    return "\n\n".join(lines) if lines else "_(chart code produced)_"
 
 
 async def _stream_smoothed(msg: cl.Message, text: str) -> None:
@@ -168,50 +224,25 @@ async def _stream_smoothed(msg: cl.Message, text: str) -> None:
         await asyncio.sleep(SMOOTH_STREAM_CHAR_DELAY_S)
 
 
-def _build_chart(spec: ChartSpec, rows: list[dict]):
-    """Build a Plotly figure from a ChartSpec + rows. Returns None if the spec
-    is unrenderable (kind="none"/"table", missing rows, missing columns).
+def _build_chart(chart: ChartCode | None, rows: list[dict], context: str = ""):
+    """Execute LLM-generated chart code in the sandbox; return the produced Figure.
 
-    Honors layout knobs on bar/line: barmode, orientation, facet_col, sort_by.
-    Silently skips a knob if it's malformed (e.g., facet_col not in df.columns)
-    rather than failing the whole chart — the 2D base chart is still useful.
+    Graceful degradation: any sandbox/runtime failure logs to stderr and returns
+    None so the prose summary still goes through. Logging matters: a silently
+    skipped chart looks identical to a section that legitimately had no chart.
     """
-    if not rows or spec.kind in (None, "none", "table"):
+    if chart is None or not chart.code:
         return None
-    df = pd.DataFrame(rows)
-
-    # Sort the dataframe if a sort column was specified.
-    if spec.sort_by and spec.sort_by in df.columns:
-        df = df.sort_values(spec.sort_by, ascending=not bool(spec.sort_desc))
-
-    title = spec.title or ""
-    color = spec.group if spec.kind in ("bar", "line") and spec.group in df.columns else None
-    facet_col = spec.facet_col if spec.kind in ("bar", "line") and spec.facet_col in df.columns else None
-    orientation = spec.orientation or "v"
-
-    # Default barmode: "group" if a color dimension exists, otherwise relative.
-    barmode = spec.barmode or ("group" if color else "relative")
-
+    label = f" [{context}]" if context else ""
     try:
-        if spec.kind == "bar":
-            return px.bar(
-                df, x=spec.x, y=spec.y,
-                color=color, facet_col=facet_col,
-                title=title, barmode=barmode, orientation=orientation,
-            )
-        if spec.kind == "line":
-            return px.line(
-                df, x=spec.x, y=spec.y,
-                color=color, facet_col=facet_col,
-                title=title, markers=True, orientation=orientation,
-            )
-        if spec.kind == "pie":
-            return px.pie(df, names=spec.x, values=spec.y, title=title)
-    except Exception:
-        # Bad column types, missing data, etc. — silently skip the chart;
-        # the prose summary is still the primary answer.
+        return execute_chart_code(chart.code, rows)
+    except SandboxError as e:
+        logger.warning("Chart sandbox rejected code%s: %s", label, e)
+        logger.warning("Offending code:\n%s", chart.code)
         return None
-    return None
+    except Exception as e:
+        logger.warning("Chart build raised%s: %s: %s", label, type(e).__name__, e)
+        return None
 
 
 def _extract_text(chunk_content) -> str:
@@ -248,7 +279,7 @@ async def on_message(message: cl.Message):
     final_answer = cl.Message(content="")
     summary_from_state: str | None = None
     rows_for_chart: list[dict] = []
-    chart_spec: ChartSpec | None = None
+    chart_spec: ChartCode | None = None
     fa_intent: str | None = None  # captured from front_agent's on_chain_end
 
     try:
@@ -262,9 +293,15 @@ async def on_message(message: cl.Message):
             meta = ev.get("metadata") or {}
             node_for_metadata = meta.get("langgraph_node")
 
-            # Stream summarize LLM tokens straight into the user-facing message.
-            # No Step for summarize — the streaming message IS its visible output.
-            if kind == "on_chat_model_stream" and node_for_metadata == "summarize":
+            # Stream LLM tokens for nodes whose output IS the visible message:
+            #   - summarize        (data path)
+            #   - generate_response (respond/rechart paths)
+            #   - aggregate_report (report path — the multi-section narrative)
+            # No Step for any of these — the streaming message IS their output.
+            if (
+                kind == "on_chat_model_stream"
+                and node_for_metadata in ("summarize", "generate_response", "aggregate_report")
+            ):
                 chunk = ev["data"].get("chunk")
                 if chunk is not None:
                     text = _extract_text(chunk.content)
@@ -272,23 +309,50 @@ async def on_message(message: cl.Message):
                         await _stream_smoothed(final_answer, text)
                 continue
 
-            # Lifecycle for the four upstream pipeline nodes.
+            # Lifecycle for pipeline nodes. Key by run_id (not name) so parallel
+            # invocations of the same node — e.g., the fan-out of sub_query
+            # branches during report generation — each get their own Step
+            # rendered live, instead of colliding on a single open_steps[name].
             if name in NODE_LABEL:
-                if kind == "on_chain_start" and name not in open_steps:
-                    step = cl.Step(
-                        name=NODE_LABEL[name],
-                        type="run",
-                        default_open=False,
-                    )
+                run_id = ev.get("run_id")
+
+                if kind == "on_chain_start" and run_id and run_id not in open_steps:
+                    label = NODE_LABEL[name]
+                    # For parallel sub_query branches, surface the section title
+                    # in the Step header so the user can see all sections
+                    # progressing simultaneously and tell them apart. Without
+                    # a unique label, Chainlit's UI consolidates same-named
+                    # Steps into one widget and the others go invisible.
+                    if name == "sub_query":
+                        input_data = (ev.get("data") or {}).get("input") or {}
+                        section = (
+                            input_data.get("current_section")
+                            if isinstance(input_data, dict) else None
+                        )
+                        # Section may arrive as Pydantic model OR plain dict
+                        # depending on serde rehydration timing.
+                        if isinstance(section, dict):
+                            section_title = section.get("title")
+                        elif section is not None:
+                            section_title = getattr(section, "title", None)
+                        else:
+                            section_title = None
+                        if section_title:
+                            label = f"{label}: {section_title}"
+                        else:
+                            # Fallback so Chainlit doesn't merge identically-
+                            # named parallel Steps: tag with a short run-id.
+                            label = f"{label} [{str(run_id)[:8]}]"
+                    step = cl.Step(name=label, type="run", default_open=False)
                     icon = NODE_ICON.get(name)
                     if icon:
                         step.icon = icon
                     step.show_input = False
                     await step.send()
-                    open_steps[name] = step
+                    open_steps[run_id] = step
 
-                elif kind == "on_chain_end":
-                    step = open_steps.pop(name, None)
+                elif kind == "on_chain_end" and run_id:
+                    step = open_steps.pop(run_id, None)
                     output = ev["data"].get("output") or {}
                     if step is not None:
                         step.output = _step_body(name, output)
@@ -310,6 +374,20 @@ async def on_message(message: cl.Message):
                 if output.get("summary"):
                     summary_from_state = output["summary"]
 
+            # Same for generate_response — its streamed text is the visible
+            # reply on respond/rechart paths. Defensive fallback in case
+            # streaming chunks didn't fire.
+            elif name == "generate_response" and kind == "on_chain_end":
+                output = ev["data"].get("output") or {}
+                if output.get("summary"):
+                    summary_from_state = output["summary"]
+
+            # aggregate_report streams the report markdown; capture as fallback.
+            elif name == "aggregate_report" and kind == "on_chain_end":
+                output = ev["data"].get("output") or {}
+                if output.get("summary"):
+                    summary_from_state = output["summary"]
+
     except Exception as e:
         for step in open_steps.values():
             step.output = f"❌ Aborted: {type(e).__name__}"
@@ -317,8 +395,12 @@ async def on_message(message: cl.Message):
         await cl.Message(content=f"**Graph error:** `{type(e).__name__}: {e}`").send()
         return
 
+    # Respond / rechart paths don't run summarize, so nothing has streamed
+    # into final_answer yet. Pipe the front_agent's reply through the smooth
+    # streamer so the user sees a typewriter animation just like a data turn,
+    # rather than a full reply popping in at once.
     if not final_answer.content and summary_from_state:
-        final_answer.content = summary_from_state
+        await _stream_smoothed(final_answer, summary_from_state)
     if not final_answer.content:
         final_answer.content = "_(no response produced)_"
 
@@ -333,11 +415,47 @@ async def on_message(message: cl.Message):
     # — kind="none"/"table" or invalid column shapes leave fig=None.
     chart_attached = False
     if chart_spec is not None and rows_for_chart:
-        fig = _build_chart(chart_spec, rows_for_chart)
+        fig = _build_chart(chart_spec, rows_for_chart, context="data turn")
         if fig is not None:
             final_answer.elements = [
                 cl.Plotly(name="chart", figure=fig, display="inline")
             ]
+            chart_attached = True
+
+    # Report path: attach one Plotly element per section that has a chart.
+    # Sections live in checkpointed state; pull the final list once.
+    if fa_intent == "report":
+        snapshot = await app_graph.aget_state(config)
+        report_sections = snapshot.values.get("report_sections") or []
+        # Re-sort into outline order
+        outline = snapshot.values.get("report_outline") or []
+        title_pos = {getattr(s, "title", ""): i for i, s in enumerate(outline)}
+        report_sections = sorted(
+            report_sections,
+            key=lambda s: title_pos.get(getattr(s, "title", ""), len(outline) + 1),
+        )
+        report_elements = []
+        for section in report_sections:
+            chart = getattr(section, "chart", None)
+            # Prefer rows_for_chart (capped at ~500) — rows_preview is only
+            # 10 rows, which makes LLM-generated chart code fail or render
+            # empty for trend/top-N plots.
+            chart_rows = (
+                getattr(section, "rows_for_chart", None)
+                or getattr(section, "rows_preview", None)
+                or []
+            )
+            if chart is None or not chart_rows:
+                continue
+            section_title = getattr(section, "title", "section")
+            fig = _build_chart(chart, chart_rows, context=f"section: {section_title}")
+            if fig is None:
+                continue
+            # Section title becomes the element name → Chainlit shows it as a label
+            title = getattr(section, "title", "section")
+            report_elements.append(cl.Plotly(name=title, figure=fig, display="inline"))
+        if report_elements:
+            final_answer.elements = (final_answer.elements or []) + report_elements
             chart_attached = True
 
     # Inline table fallback: data/rechart turns where no chart rendered should

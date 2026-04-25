@@ -1,37 +1,57 @@
-from typing import Annotated, Literal, TypedDict
+from typing import Annotated, Any, Literal, TypedDict
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel
 
 
-class ChartSpec(BaseModel):
-    kind: Literal["bar", "line", "pie", "table", "none"]
-    x: str | None = None       # column for category / time axis
-    y: str | None = None       # column for the numeric measure
-    group: str | None = None   # optional 3rd column for color grouping (bar/line only)
-    title: str | None = None
-    reasoning: str | None = None
+def _merge_report_sections(prior: list | None, new: Any) -> list:
+    """Reducer for report_sections.
 
-    # Layout knobs — expose just enough plotly express args to handle common
-    # user follow-ups like "stack the bars", "make it horizontal", "facet per genre",
-    # "sort by count". All optional; bar/line only (pie ignores them).
-    barmode: Literal["group", "stack", "relative", "overlay"] | None = None
-    orientation: Literal["v", "h"] | None = None
-    facet_col: str | None = None       # subplot dimension (column from result)
-    sort_by: str | None = None         # column to sort x-axis by
-    sort_desc: bool | None = None      # True for descending
+    Receiving None resets to empty list — used by plan_report to clear
+    the accumulator at the start of each report turn (the default
+    `operator.add` reducer can't reset because `prior + [] == prior`).
+    Receiving a list appends — used by parallel sub_query branches.
+    """
+    if new is None:
+        return []
+    if isinstance(new, list):
+        return (prior or []) + new
+    return prior or []
+
+
+class ChartCode(BaseModel):
+    """LLM-authored chart specification.
+
+    Replaces the old declarative ChartSpec (kind/x/y/group/...) with executable
+    Python code that the model writes against a `df: pd.DataFrame` and returns
+    via a `fig` variable. The sandbox in agent.chart_sandbox enforces safety.
+
+    Why code instead of a fixed schema? plotly.express's defaults don't always
+    match the data shape (axis ordering, label formats, log scales, etc.).
+    Letting the LLM write transform + plot code gives chart quality on par
+    with what Claude Chat produces in its sandbox, without requiring us to
+    enumerate every possible plotly knob in a schema.
+    """
+    reasoning: str | None = None      # one sentence: what this chart shows
+    code: str | None = None           # Python that produces a `fig` variable
+    title: str | None = None          # short caption — useful for traceability/UI
+
+
+# Deprecated alias — old tests and external callers still reference ChartSpec.
+# New code must use ChartCode. Schema is the same; just a different name.
+ChartSpec = ChartCode
 
 
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
     question: str                    # current turn's raw user input
-    intent: Literal["data", "respond", "rechart"] | None
+    intent: Literal["data", "respond", "rechart", "report"] | None
     data_question: str | None        # front agent's refined, self-contained restatement for SQL gen
     sql: str | None
     sql_error: str | None
     rows: list[dict] | None
     summary: str | None
-    chart: ChartSpec | None
+    chart: ChartCode | None
     chart_kind_override: Literal["bar", "line", "pie", "table"] | None
     retries: int
     # Diagnostic surfaced to summarize when the main query returned 0 rows.
@@ -39,6 +59,16 @@ class AgentState(TypedDict):
     # but here's what IS available" rather than a flat "no rows".
     diagnostic_sql: str | None
     diagnostic_rows: list[dict] | None
+    # Report-mode fields. report_outline is the planner's blueprint;
+    # report_sections accumulates one entry per parallel sub_query (custom
+    # reducer to support reset-via-None); report_text is the final assembled
+    # markdown from aggregate_report. current_section is the per-Send payload
+    # carrying which section the parallel sub_query is processing.
+    report_outline: list[Any] | None             # list[ReportSection], avoid circular import
+    report_plan_rationale: str | None
+    report_sections: Annotated[list[Any], _merge_report_sections]
+    report_text: str | None
+    current_section: Any | None
 
 
 def turn_input(question: str, human_message: BaseMessage) -> dict:
@@ -62,4 +92,11 @@ def turn_input(question: str, human_message: BaseMessage) -> dict:
         "summary": None,
         "chart_kind_override": None,
         "retries": 0,
+        # Report fields reset every turn — they're scoped to the current report
+        # and must not leak in from a prior turn.
+        "report_outline": None,
+        "report_plan_rationale": None,
+        "report_sections": None,  # custom reducer interprets None as "reset to []"
+        "report_text": None,
+        "current_section": None,
     }

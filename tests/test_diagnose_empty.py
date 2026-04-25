@@ -9,7 +9,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from agent.graph import app_graph
 from agent.nodes import diagnose_empty
 from agent.schemas import FrontAgentDecision, SQLGeneration
-from agent.state import ChartSpec, turn_input
+from agent.state import ChartCode, turn_input
 
 
 # ---------- node-level: short-circuits ----------
@@ -187,7 +187,7 @@ async def test_empty_result_routes_through_diagnose_empty_to_summarize():
     sql_gen.invoke.side_effect = [sql_main, sql_diag]
 
     chart_picker = MagicMock()
-    chart_picker.invoke.return_value = ChartSpec(kind="none", reasoning="empty result")
+    chart_picker.invoke.return_value = ChartCode(reasoning="empty result", code=None)
 
     summary_llm = MagicMock()
     summary_llm.ainvoke = AsyncMock(return_value=AIMessage(
@@ -249,7 +249,7 @@ async def test_non_empty_result_skips_diagnose_empty():
     )
 
     chart_picker = MagicMock()
-    chart_picker.invoke.return_value = ChartSpec(kind="none")
+    chart_picker.invoke.return_value = ChartCode(code=None)
 
     summary_llm = MagicMock()
     summary_llm.ainvoke = AsyncMock(return_value=AIMessage(content="ok"))

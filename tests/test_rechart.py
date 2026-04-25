@@ -1,41 +1,29 @@
 """Tests for the 'rechart' intent — front_agent skips SQL and routes
-straight to generate_chart with prior-turn rows."""
+straight to generate_response → generate_chart with prior-turn rows."""
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pydantic
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
 from agent.graph import app_graph
 from agent.nodes import generate_chart
 from agent.schemas import FrontAgentDecision
-from agent.state import ChartSpec, turn_input
+from agent.state import ChartCode, turn_input
 
 
 # ---------- schema validators ----------
 
 def test_rechart_decision_valid():
-    d = FrontAgentDecision(
-        intent="rechart",
-        response_text="Here it is as a pie chart.",
-        chart_kind_override="pie",
-    )
+    """FrontAgentDecision is now routing-only — no response_text field."""
+    d = FrontAgentDecision(intent="rechart", chart_kind_override="pie")
     assert d.intent == "rechart"
     assert d.chart_kind_override == "pie"
     assert d.data_question is None
 
 
-def test_rechart_decision_without_response_text_rejected():
-    with pytest.raises(pydantic.ValidationError):
-        FrontAgentDecision(intent="rechart", chart_kind_override="pie")
-
-
 def test_rechart_decision_without_kind_override_is_allowed():
     """User asked 'replot' without specifying kind — let the picker decide."""
-    d = FrontAgentDecision(
-        intent="rechart",
-        response_text="Here's an updated chart.",
-    )
+    d = FrontAgentDecision(intent="rechart")
     assert d.chart_kind_override is None
 
 
@@ -48,7 +36,7 @@ def _state(**overrides):
         "rows": [{"title": f"f{i}", "count": 30 - i} for i in range(5)],
         "sql_error": None,
         "intent": "rechart",
-        "chart": ChartSpec(kind="bar", x="title", y="count", title="Prior caption"),
+        "chart": ChartCode(code="fig = px.bar(df, x='title', y='count')", title="Prior caption"),
         "chart_kind_override": None,
         "retries": 0,
     }
@@ -64,45 +52,53 @@ def test_table_override_short_circuits_no_llm_call():
     picker.assert_not_called()
 
 
-def test_rechart_calls_picker_with_prior_chart_in_prompt():
-    """The picker prompt MUST include the prior chart spec so the LLM has
-    context to apply user modifications."""
-    prior = ChartSpec(kind="bar", x="title", y="count",
-                      title="Top 5 films by 2022 rental count", group=None)
-    new_spec = ChartSpec(kind="pie", x="title", y="count",
-                         title="Top 5 films by 2022 rental count")
+def test_rechart_calls_picker_with_prior_code_in_prompt():
+    """The picker prompt MUST include the prior chart's code so the LLM has
+    context to apply user modifications to the existing visualization."""
+    prior = ChartCode(
+        reasoning="Bar chart of top films",
+        code="fig = px.bar(df, x='title', y='count', title='Top 5 films by 2022 rental count')",
+        title="Top 5 films by 2022 rental count",
+    )
+    new_chart = ChartCode(
+        reasoning="Pie chart variant",
+        code="fig = px.pie(df, names='title', values='count', title='Top 5 films by 2022 rental count')",
+        title="Top 5 films by 2022 rental count",
+    )
     picker = MagicMock()
-    picker.invoke.return_value = new_spec
+    picker.invoke.return_value = new_chart
     with patch("agent.nodes._chart_picker", return_value=picker):
         out = generate_chart(_state(
             question="Replot as a pie chart",
             chart=prior,
             chart_kind_override="pie",
         ))
-    assert out["chart"] is new_spec
+    assert out["chart"] is new_chart
     picker.invoke.assert_called_once()
     msgs = picker.invoke.call_args.args[0]
     user_content = next(m for m in msgs if m["role"] == "user")["content"]
-    # Prior chart shape and the user's modification are both visible to the picker
-    assert "Top 5 films by 2022 rental count" in user_content
+    # Prior code AND the user's modification are visible to the picker
+    assert "px.bar(df, x='title', y='count'" in user_content
     assert "Replot as a pie chart" in user_content
-    import re
-    assert re.search(r"kind:\s+bar", user_content), "prior kind not visible to picker"
 
 
 def test_rechart_axis_change_propagates_via_picker():
-    """The user-supplied phrasing 'switch the x axis to genre' should reach
-    the picker. The picker can then return a spec with the new x."""
+    """User-supplied 'switch the x axis to genre' reaches the picker, which
+    can return code that uses the new x column."""
     rows = [
         {"genre": "Action", "title": "f1", "count": 10},
         {"genre": "Drama",  "title": "f2", "count": 8},
     ]
-    prior = ChartSpec(kind="bar", x="title", y="count",
-                      title="Top films per genre", group=None)
-    new_spec = ChartSpec(kind="bar", x="genre", y="count",
-                         title="Counts by genre", group=None)
+    prior = ChartCode(
+        code="fig = px.bar(df, x='title', y='count', title='Top films per genre')",
+        title="Top films per genre",
+    )
+    new_chart = ChartCode(
+        code="fig = px.bar(df, x='genre', y='count', title='Counts by genre')",
+        title="Counts by genre",
+    )
     picker = MagicMock()
-    picker.invoke.return_value = new_spec
+    picker.invoke.return_value = new_chart
     with patch("agent.nodes._chart_picker", return_value=picker):
         out = generate_chart(_state(
             question="Switch the x axis to genre",
@@ -110,50 +106,55 @@ def test_rechart_axis_change_propagates_via_picker():
             rows=rows,
             chart_kind_override=None,  # axis change, no kind change
         ))
-    assert out["chart"].x == "genre"
+    assert "x='genre'" in out["chart"].code
     msgs = picker.invoke.call_args.args[0]
     user_content = next(m for m in msgs if m["role"] == "user")["content"]
     assert "Switch the x axis to genre" in user_content
 
 
-def test_rechart_invalid_columns_fall_back_to_prior():
-    """If the picker hallucinates a column, don't erase the user's chart —
-    keep the prior one rather than returning None."""
-    prior = ChartSpec(kind="bar", x="title", y="count",
-                      title="Top films", group=None)
-    new_spec = ChartSpec(kind="bar", x="bogus", y="count", title="Bad")
+def test_rechart_picker_returning_no_code_falls_back_to_prior():
+    """If the picker declines (code=None), preserve the user's existing chart."""
+    prior = ChartCode(
+        code="fig = px.bar(df, x='title', y='count')",
+        title="Top films",
+    )
+    declined = ChartCode(reasoning="Couldn't figure it out", code=None)
     picker = MagicMock()
-    picker.invoke.return_value = new_spec
+    picker.invoke.return_value = declined
     with patch("agent.nodes._chart_picker", return_value=picker):
         out = generate_chart(_state(
             question="Switch the x axis",
             chart=prior,
         ))
-    assert out["chart"] is prior  # unchanged, not erased
+    assert out["chart"] is prior  # unchanged
 
 
-def test_rechart_picker_dropping_to_none_returns_no_chart():
-    """If the picker decides the result isn't chartable, return no chart."""
-    new_spec = ChartSpec(kind="none", reasoning="(actually unchartable)")
+def test_rechart_picker_dropping_to_none_with_no_prior_returns_none():
+    """No prior chart AND picker declines → no chart at all."""
+    declined = ChartCode(reasoning="Not chartable", code=None)
     picker = MagicMock()
-    picker.invoke.return_value = new_spec
+    picker.invoke.return_value = declined
     with patch("agent.nodes._chart_picker", return_value=picker):
-        out = generate_chart(_state(question="Try something else"))
+        out = generate_chart(_state(question="Try something else", chart=None))
     assert out == {"chart": None}
 
 
 def test_data_turn_unaffected_by_rechart_logic():
-    """Sanity: data turn (intent="data") still uses the regular CHART_SPEC_USER
-    template, NOT the rechart prompt. Prior chart is irrelevant."""
-    spec = ChartSpec(kind="bar", x="title", y="count", title="ok")
+    """Data turn (intent='data') uses the fresh CHART_CODE_USER prompt,
+    not the rechart prompt. Prior chart is irrelevant."""
+    chart = ChartCode(
+        reasoning="Top 5",
+        code="fig = px.bar(df, x='title', y='count')",
+        title="Top 5 films",
+    )
     picker = MagicMock()
-    picker.invoke.return_value = spec
+    picker.invoke.return_value = chart
     with patch("agent.nodes._chart_picker", return_value=picker):
         out = generate_chart(_state(intent="data", question="Top 5 films"))
-    assert out["chart"] is spec
+    assert out["chart"] is chart
     msgs = picker.invoke.call_args.args[0]
     user_content = next(m for m in msgs if m["role"] == "user")["content"]
-    assert "modify an EXISTING chart" not in user_content  # rechart prompt not used
+    assert "MODIFY an existing chart" not in user_content  # rechart prompt not used
     assert "Question: Top 5 films" in user_content
 
 
@@ -169,11 +170,7 @@ async def test_rechart_path_skips_sql_and_uses_persisted_rows():
     front_llm = MagicMock()
     front_llm.invoke.side_effect = [
         FrontAgentDecision(intent="data", data_question="Top 5 films by rental count in 2022"),
-        FrontAgentDecision(
-            intent="rechart",
-            response_text="Here it is as a pie chart.",
-            chart_kind_override="pie",
-        ),
+        FrontAgentDecision(intent="rechart", chart_kind_override="pie"),
     ]
 
     sql_llm = MagicMock()
@@ -188,18 +185,26 @@ async def test_rechart_path_skips_sql_and_uses_persisted_rows():
 
     rows_returned = [{"title": f"film_{i}", "rentals": 30 - i} for i in range(5)]
 
+    # generate_response now runs on rechart turns — needs its own async mock.
+    response_llm = MagicMock()
+    response_llm.ainvoke = AsyncMock(return_value=AIMessage(content="Here it is as a pie chart."))
+
     with (
         patch("agent.nodes._front_agent_llm", return_value=front_llm),
         patch("agent.nodes._sql_generator", return_value=sql_llm),
         patch("agent.nodes._summarizer", return_value=summary_llm),
+        patch("agent.nodes._response_llm", return_value=response_llm),
         patch("agent.nodes._chart_picker") as chart_picker_mock,
         patch("agent.nodes.pagila_schema_string", return_value="<schema>"),
+        patch("agent.nodes.vocabulary_string", return_value="<vocab>"),
         patch("agent.nodes.run_query", return_value=rows_returned),
     ):
         # Turn 1 chart picker returns the original bar; turn 2 returns the pie.
         chart_picker_mock.return_value.invoke.side_effect = [
-            ChartSpec(kind="bar", x="title", y="rentals", title="Top 5 films by rental count in 2022"),
-            ChartSpec(kind="pie", x="title", y="rentals", title="Top 5 films by rental count in 2022"),
+            ChartCode(code="fig = px.bar(df, x='title', y='rentals')",
+                      title="Top 5 films by rental count in 2022"),
+            ChartCode(code="fig = px.pie(df, names='title', values='rentals')",
+                      title="Top 5 films by rental count in 2022"),
         ]
 
         config = {"configurable": {"thread_id": "rechart-test"}}
@@ -211,7 +216,7 @@ async def test_rechart_path_skips_sql_and_uses_persisted_rows():
         )
         assert s1["intent"] == "data"
         assert s1["rows"] == rows_returned
-        assert s1["chart"] is not None and s1["chart"].kind == "bar"
+        assert s1["chart"] is not None and "px.bar" in s1["chart"].code
 
         # Reset mocks to assert turn 2 invocations specifically
         sql_llm.invoke.reset_mock()
@@ -230,11 +235,11 @@ async def test_rechart_path_skips_sql_and_uses_persisted_rows():
     chart_picker_mock.return_value.invoke.assert_called_once()
     msgs = chart_picker_mock.return_value.invoke.call_args.args[0]
     user_content = next(m for m in msgs if m["role"] == "user")["content"]
-    assert "modify an EXISTING chart" in user_content
+    assert "MODIFY an existing chart" in user_content
     assert "Replot as a pie chart" in user_content
     # State carries the rechart intent and the new pie chart spec
     assert s2["intent"] == "rechart"
     assert s2["summary"] == "Here it is as a pie chart."
-    assert s2["chart"].kind == "pie"
+    assert s2["chart"].code is not None and "px.pie" in s2["chart"].code
     # Rows persisted from turn 1 (cross-turn memory)
     assert s2["rows"] == rows_returned

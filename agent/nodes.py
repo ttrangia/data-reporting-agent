@@ -1,3 +1,4 @@
+import asyncio
 import json
 from functools import cache
 
@@ -8,15 +9,23 @@ from sqlalchemy.exc import DBAPIError, OperationalError
 from agent.db import pagila_schema_string, run_query, vocabulary_string
 from agent.chart_directive import detect as detect_chart_directive
 from agent.prompts import (
+    CHART_CODE_SYSTEM,
+    CHART_CODE_USER,
     CHART_FORCE_NOTE,
-    CHART_SPEC_SYSTEM,
-    CHART_SPEC_USER,
     DATASET_NOTES,
     DIAGNOSE_EMPTY_SYSTEM,
     DIAGNOSE_EMPTY_USER,
+    GENERATE_RESPONSE_SYSTEM,
+    GENERATE_RESPONSE_USER,
     RECHART_USER,
     FRONT_AGENT_SYSTEM,
     FRONT_AGENT_USER,
+    REPORT_AGGREGATOR_SYSTEM,
+    REPORT_AGGREGATOR_USER,
+    REPORT_PLANNER_SYSTEM,
+    REPORT_PLANNER_USER,
+    SECTION_SUMMARIZER_SYSTEM,
+    SECTION_SUMMARIZER_USER,
     SQL_GENERATION_RETRY_HINT,
     SQL_GENERATION_SYSTEM,
     SQL_GENERATION_USER,
@@ -24,9 +33,9 @@ from agent.prompts import (
     SUMMARIZE_USER,
 )
 from agent.safety import check_input
-from agent.schemas import FrontAgentDecision, SQLGeneration
+from agent.schemas import FrontAgentDecision, ReportPlan, ReportSection, SQLGeneration
 from agent.sql_guard import guard
-from agent.state import AgentState, ChartSpec
+from agent.state import AgentState, ChartCode
 
 MAX_RETRIES = 2
 SUMMARIZE_ROW_BUDGET = 50
@@ -75,9 +84,36 @@ def _summarizer():
 
 
 @cache
+def _response_llm():
+    # Plain LLM for the streaming respond/rechart reply. Haiku — short outputs,
+    # latency matters here since this is the user's first visible token after
+    # routing.
+    return ChatAnthropic(model="claude-haiku-4-5-20251001", temperature=0)
+
+
+@cache
 def _chart_picker():
     llm = ChatAnthropic(model="claude-sonnet-4-6", temperature=0)
-    return llm.with_structured_output(ChartSpec)
+    return llm.with_structured_output(ChartCode)
+
+
+@cache
+def _report_planner():
+    llm = ChatAnthropic(model="claude-sonnet-4-6", temperature=0)
+    return llm.with_structured_output(ReportPlan)
+
+
+@cache
+def _section_summarizer():
+    # Plain Haiku — short per-section blurbs, fast.
+    return ChatAnthropic(model="claude-haiku-4-5-20251001", temperature=0)
+
+
+@cache
+def _report_aggregator():
+    # Plain Sonnet — composing the report is the user-visible final pass.
+    # Sonnet's prose quality matters more than latency here.
+    return ChatAnthropic(model="claude-sonnet-4-6", temperature=0)
 
 
 def _format_history(messages: list[BaseMessage], current_question: str) -> str:
@@ -137,17 +173,59 @@ def front_agent(state: AgentState) -> dict:
         return {"intent": "data", "data_question": decision.data_question}
 
     if decision.intent == "rechart":
+        # No summary/messages here — generate_response will stream the reply.
         return {
             "intent": "rechart",
-            "summary": decision.response_text,
             "chart_kind_override": decision.chart_kind_override,
-            "messages": [AIMessage(content=decision.response_text)],
         }
 
+    if decision.intent == "report":
+        # Report path: plan_report → fan-out → aggregate. No summary set here.
+        return {"intent": "report"}
+
+    # respond — leave summary unset so generate_response can stream it.
+    return {"intent": "respond"}
+
+
+async def generate_response(state: AgentState) -> dict:
+    """Stream a brief plain-text reply for respond/rechart intents.
+
+    Async + ainvoke so token-level streaming events propagate under
+    astream_events. The streaming chunks land directly in the user-facing
+    cl.Message (filtered on `langgraph_node == "generate_response"` in app.py).
+    Sets state.summary on completion as a defensive fallback if streaming
+    chunks were lost.
+    """
+    intent = state["intent"]
+
+    if intent == "rechart":
+        prior = state.get("chart")
+        kind_hint = state.get("chart_kind_override") or "(not specified)"
+        intent_context = (
+            "User wants to modify the prior chart.\n"
+            f"Requested chart kind: {kind_hint}\n"
+            f"Prior chart title: {prior.title if prior else '(none)'}\n"
+        )
+    else:
+        intent_context = ""
+
+    user_msg = GENERATE_RESPONSE_USER.format(
+        conversation=_format_history(state.get("messages") or [], state["question"]),
+        question=state["question"],
+        intent=intent,
+        intent_context=intent_context,
+    )
+    msg = await _response_llm().ainvoke(
+        [{"role": "system", "content": GENERATE_RESPONSE_SYSTEM},
+         {"role": "user", "content": user_msg}]
+    )
+    text = msg.content if isinstance(msg.content, str) else "".join(
+        b.get("text", "") for b in msg.content
+        if isinstance(b, dict) and b.get("type") in ("text", "text_delta")
+    )
     return {
-        "intent": "respond",
-        "summary": decision.response_text,
-        "messages": [AIMessage(content=decision.response_text)],
+        "summary": text,
+        "messages": [AIMessage(content=text)],
     }
 
 
@@ -228,69 +306,45 @@ def execute_sql(state: AgentState) -> dict:
         }
 
 
-def _force_default_spec(rows: list[dict], question: str) -> ChartSpec:
-    """Pick a sensible default chart when the user explicitly asked for one
-    but the LLM declined. Heuristic: take the rightmost numeric column as y
-    (typically the aggregate) and the first non-numeric or first column as x."""
+def _generate_chart_code_for(question: str, rows: list[dict], force: bool = False) -> ChartCode | None:
+    """Ask the LLM to write Plotly code for these rows.
+
+    Returns a ChartCode (with `.code` populated) when the LLM produces one,
+    or None when the LLM declines (no chart fits) and `force` is False.
+    Doesn't execute the code — that happens in app._build_chart against
+    the sandbox. Empty/None code → None.
+    """
+    if not rows:
+        return None
     columns = list(rows[0].keys())
-    numeric_cols = [
-        c for c in columns
-        if all(isinstance(r.get(c), (int, float)) and not isinstance(r.get(c), bool)
-               for r in rows[:5] if r.get(c) is not None)
-    ]
-    y = numeric_cols[-1] if numeric_cols else columns[-1]
-    x_candidates = [c for c in columns if c != y]
-    x = x_candidates[0] if x_candidates else columns[0]
-    return ChartSpec(
-        kind="bar", x=x, y=y,
-        title=question.strip().rstrip("?.!")[:80],
-        reasoning="User explicitly requested a chart; picked bar as a sensible default.",
+    sample = rows[:CHART_ROW_BUDGET]
+    user = CHART_CODE_USER.format(
+        directive_note=CHART_FORCE_NOTE if force else "",
+        question=question,
+        columns=", ".join(columns),
+        n_total=len(rows),
+        n_shown=len(sample),
+        rows_json=json.dumps(sample, default=str, indent=2),
     )
-
-
-def _validate_chart_spec(spec: ChartSpec, columns: list[str]) -> ChartSpec:
-    """Drop bogus column refs and unsupported layout knobs, in place."""
-    if spec.kind == "pie":
-        # Pie ignores all the layout knobs except title/x/y.
-        spec.group = None
-        spec.barmode = None
-        spec.orientation = None
-        spec.facet_col = None
-        spec.sort_by = None
-        spec.sort_desc = None
-    elif spec.kind in ("bar", "line"):
-        if spec.group and spec.group not in columns:
-            spec.group = None
-        if spec.facet_col and spec.facet_col not in columns:
-            spec.facet_col = None
-        if spec.sort_by and spec.sort_by not in columns:
-            spec.sort_by = None
-            spec.sort_desc = None
-        # line doesn't use barmode
-        if spec.kind == "line":
-            spec.barmode = None
-    else:
-        # none/table — all layout knobs irrelevant
-        spec.group = None
-        spec.barmode = None
-        spec.orientation = None
-        spec.facet_col = None
-        spec.sort_by = None
-        spec.sort_desc = None
-    return spec
+    chart_code: ChartCode = _chart_picker().invoke(
+        [{"role": "system", "content": CHART_CODE_SYSTEM},
+         {"role": "user", "content": user}]
+    )
+    if not chart_code.code:
+        return None
+    return chart_code
 
 
 def generate_chart(state: AgentState) -> dict:
-    """Pick a visualization for the result rows.
+    """Generate Python plotting code for the result rows.
 
     Two flows depending on whether this is a fresh data turn or a rechart turn:
 
-    - **Data turn** (intent="data" or no intent): chart picker emits a fresh
-      spec. Honors the user-message chart directive (skip / force / auto).
-    - **Rechart turn** (intent="rechart"): picker is called AGAIN with the
-      prior chart spec + the user's modification request in the prompt.
-      Lets the LLM apply arbitrary edits ("switch x", "color by genre",
-      "swap axes", etc.), not just kind changes.
+    - **Data turn**: LLM writes code from scratch given the question + rows.
+      Honors the user-message chart directive (skip / force / auto).
+    - **Rechart turn**: LLM gets the prior code + the user's modification
+      request and produces a new version — arbitrary edits supported
+      ("switch x", "color by genre", "log scale on y", "rotate labels", ...).
 
     Two deterministic fast paths skip the LLM entirely:
     - sql_error or no rows → no chart
@@ -303,7 +357,6 @@ def generate_chart(state: AgentState) -> dict:
     intent = state.get("intent")
     override = state.get("chart_kind_override")
 
-    # Fast path: user explicitly wants table view, no chart.
     if override == "table":
         return {"chart": None}
 
@@ -316,39 +369,26 @@ def generate_chart(state: AgentState) -> dict:
         user = RECHART_USER.format(
             data_question=state.get("data_question") or "(unknown)",
             question=state.get("question") or "(no message)",
-            prior_kind=prior.kind if prior else "(none)",
-            prior_x=prior.x if prior else "(none)",
-            prior_y=prior.y if prior else "(none)",
-            prior_group=prior.group if prior else "(none)",
-            prior_title=prior.title if prior else "(none)",
-            prior_barmode=prior.barmode if prior else "(none)",
-            prior_orientation=prior.orientation if prior else "(none)",
-            prior_facet_col=prior.facet_col if prior else "(none)",
-            prior_sort_by=prior.sort_by if prior else "(none)",
-            prior_sort_desc=prior.sort_desc if prior else "(none)",
             kind_hint=override or "(none)",
+            prior_title=prior.title if prior else "(none)",
+            prior_reasoning=prior.reasoning if prior else "(none)",
+            prior_code=prior.code if prior and prior.code else "(no prior code — generate fresh)",
             columns=", ".join(columns),
             n_total=len(rows),
             n_shown=len(sample),
             rows_json=json.dumps(sample, default=str, indent=2),
         )
-        spec: ChartSpec = _chart_picker().invoke(
-            [{"role": "system", "content": CHART_SPEC_SYSTEM},
+        chart_code: ChartCode = _chart_picker().invoke(
+            [{"role": "system", "content": CHART_CODE_SYSTEM},
              {"role": "user", "content": user}]
         )
-        # On rechart, if the picker produces invalid columns, fall back to
-        # the prior chart unchanged rather than erasing the user's chart.
-        if spec.kind in ("bar", "line", "pie"):
-            if spec.x not in columns or spec.y not in columns:
-                if prior is not None:
-                    return {"chart": prior}
-                return {"chart": None}
-        spec = _validate_chart_spec(spec, columns)
-        if spec.kind in ("none", "table"):
-            return {"chart": None}
-        return {"chart": spec}
+        if not chart_code.code:
+            # LLM declined to produce code — preserve prior chart rather than
+            # erasing the user's existing visualization.
+            return {"chart": prior if prior else None}
+        return {"chart": chart_code}
 
-    # ── Data turn path (unchanged) ────────────────────────────────
+    # ── Data turn path ────────────────────────────────────────────
     raw_question = state.get("question") or ""
     directive = detect_chart_directive(raw_question)
 
@@ -357,33 +397,12 @@ def generate_chart(state: AgentState) -> dict:
     if directive == "auto" and len(rows) == 1:
         return {"chart": None}
 
-    user = CHART_SPEC_USER.format(
-        directive_note=CHART_FORCE_NOTE if directive == "force" else "",
+    chart_code = _generate_chart_code_for(
         question=state.get("data_question") or state["question"],
-        columns=", ".join(columns),
-        n_total=len(rows),
-        n_shown=len(sample),
-        rows_json=json.dumps(sample, default=str, indent=2),
+        rows=rows,
+        force=(directive == "force"),
     )
-    spec = _chart_picker().invoke(
-        [{"role": "system", "content": CHART_SPEC_SYSTEM},
-         {"role": "user", "content": user}]
-    )
-
-    if spec.kind in ("bar", "line", "pie"):
-        if spec.x not in columns or spec.y not in columns:
-            if directive == "force":
-                spec = _force_default_spec(rows, state.get("data_question") or state["question"])
-            else:
-                return {"chart": None}
-    spec = _validate_chart_spec(spec, columns)
-
-    if spec.kind in ("none", "table") and directive == "force":
-        spec = _force_default_spec(rows, state.get("data_question") or state["question"])
-
-    if spec.kind == "none":
-        return {"chart": None}
-    return {"chart": spec}
+    return {"chart": chart_code}
 
 
 def diagnose_empty(state: AgentState) -> dict:
@@ -466,4 +485,203 @@ async def summarize(state: AgentState) -> dict:
     return {
         "summary": summary_text,
         "messages": [AIMessage(content=summary_text)],
+    }
+
+
+# ── Report mode ──────────────────────────────────────────────────────────────
+
+REPORT_SECTION_ROW_PREVIEW = 10
+REPORT_SECTION_ROW_BUDGET = 30   # rows shown to the section summarizer LLM
+REPORT_SECTION_CHART_ROW_BUDGET = 500  # rows persisted on the section for chart rendering
+
+
+def plan_report(state: AgentState) -> dict:
+    """Decompose the user's broad question into 3-7 sub-questions.
+
+    Resets the report_sections accumulator (via the custom reducer's None
+    sentinel) so prior-turn sections don't leak in.
+    """
+    user = REPORT_PLANNER_USER.format(
+        question=state.get("data_question") or state["question"],
+        conversation=_format_history(state.get("messages") or [], state["question"]),
+    )
+    system = REPORT_PLANNER_SYSTEM.format(
+        dataset_notes=DATASET_NOTES,
+        vocabulary=vocabulary_string(),
+        schema=pagila_schema_string(),
+    )
+    plan: ReportPlan = _report_planner().invoke(
+        [_cached_system(system), {"role": "user", "content": user}]
+    )
+    return {
+        "report_outline": plan.sections,
+        "report_plan_rationale": plan.rationale,
+        "report_sections": None,  # reset accumulator via custom reducer
+    }
+
+
+def _section_chart(section: ReportSection, rows: list[dict]) -> ChartCode | None:
+    """Generate Plotly code for ONE report section.
+
+    Calls the LLM (one extra call per section — the cost trade-off the
+    user accepted in exchange for chart quality on par with what Claude
+    Chat produces). The planner's `chart_hint` is folded into the question
+    so the chart-coder picks the same kind unless the data argues otherwise.
+    Returns None if the planner asked for "none"/"table", if the LLM
+    declines, or if the row count is too small to plot meaningfully.
+    """
+    if not rows:
+        return None
+    if section.chart_hint in ("none", "table"):
+        return None
+    # Pass the planner's hint as part of the question so the chart-coder
+    # has the same context the planner did. Force=True since the planner
+    # already opted in to a chart for this section.
+    chart_request = (
+        f"{section.sub_question}\n"
+        f"(Section title: '{section.title}'. Suggested chart kind: '{section.chart_hint}'.)"
+    )
+    return _generate_chart_code_for(question=chart_request, rows=rows, force=True)
+
+
+async def sub_query(state: AgentState) -> dict:
+    """Run the SQL pipeline for ONE report section, in parallel with siblings.
+
+    Each invocation receives a `current_section` payload via Send. Failures
+    in any step degrade gracefully — the section keeps its title and gets
+    an `error` field so the aggregator can mention what couldn't be answered.
+
+    All blocking I/O (LLM .invoke, run_query) is offloaded to a worker thread
+    via asyncio.to_thread so parallel Send branches don't serialize on the
+    event loop — without this, on_chain_start events for sibling branches
+    can't flush until the running branch hits its first await.
+    """
+    section: ReportSection | None = state.get("current_section")
+    if section is None:
+        return {}  # defensive — Send should always populate this
+
+    # Helper: emit a degraded section with an error and stop
+    def _failed(msg: str) -> dict:
+        return {"report_sections": [section.model_copy(update={"error": msg})]}
+
+    # 1. Generate SQL
+    try:
+        sys_prompt = SQL_GENERATION_SYSTEM.format(
+            dataset_notes=DATASET_NOTES,
+            vocabulary=vocabulary_string(),
+            schema=pagila_schema_string(),
+        )
+        usr_prompt = SQL_GENERATION_USER.format(retry_context="", question=section.sub_question)
+        sql_result: SQLGeneration = await asyncio.to_thread(
+            _sql_generator().invoke,
+            [_cached_system(sys_prompt), {"role": "user", "content": usr_prompt}],
+        )
+        raw_sql = sql_result.sql
+    except Exception as e:
+        return _failed(f"SQL generation failed: {type(e).__name__}: {e}")
+
+    # 2. Validate
+    try:
+        canonical = guard(raw_sql)
+    except ValueError as e:
+        return _failed(f"Validator rejected SQL: {e}")
+
+    # 3. Execute (sqlalchemy is sync — offload so siblings can run concurrently)
+    try:
+        rows = await asyncio.to_thread(run_query, canonical)
+    except Exception as e:
+        return _failed(f"Execution failed: {type(e).__name__}: {str(e)[:200]}")
+
+    # 4. Section summary (1-2 sentences via Haiku, no streaming needed)
+    preview = rows[:REPORT_SECTION_ROW_BUDGET]
+    summarizer_user = SECTION_SUMMARIZER_USER.format(
+        title=section.title,
+        sub_question=section.sub_question,
+        sql=canonical,
+        row_count=len(rows),
+        shown_note=f", showing first {len(preview)}" if len(rows) > len(preview) else "",
+        rows_preview=json.dumps(preview, default=str, indent=2),
+    )
+    try:
+        summary_msg = await _section_summarizer().ainvoke(
+            [{"role": "system", "content": SECTION_SUMMARIZER_SYSTEM},
+             {"role": "user", "content": summarizer_user}]
+        )
+        section_summary = (
+            summary_msg.content if isinstance(summary_msg.content, str)
+            else "".join(
+                b.get("text", "") for b in summary_msg.content
+                if isinstance(b, dict) and b.get("type") in ("text", "text_delta")
+            )
+        )
+    except Exception as e:
+        section_summary = f"(summary unavailable: {type(e).__name__})"
+
+    # 5. Chart code (LLM call — also offloaded so it doesn't block siblings)
+    try:
+        chart = await asyncio.to_thread(_section_chart, section, rows)
+    except Exception:
+        chart = None
+
+    completed = section.model_copy(update={
+        "sql": canonical,
+        "row_count": len(rows),
+        "rows_preview": rows[:REPORT_SECTION_ROW_PREVIEW],
+        "rows_for_chart": rows[:REPORT_SECTION_CHART_ROW_BUDGET],
+        "summary": section_summary,
+        "chart": chart,
+    })
+    return {"report_sections": [completed]}
+
+
+async def aggregate_report(state: AgentState) -> dict:
+    """Compose the final markdown report from all completed sections.
+
+    Sections arrive in the accumulator in the order parallel branches finish
+    (non-deterministic). Re-sort to match the planner's outline before
+    composing so the narrative reads in the intended order. Streams via
+    plain LLM under astream_events.
+    """
+    outline: list[ReportSection] = state.get("report_outline") or []
+    completed: list[ReportSection] = state.get("report_sections") or []
+
+    # Sort completed sections back into outline order
+    title_to_pos = {s.title: i for i, s in enumerate(outline)}
+    sorted_sections = sorted(
+        completed, key=lambda s: title_to_pos.get(s.title, len(outline) + 1)
+    )
+
+    section_blocks = []
+    failed_lines = []
+    for s in sorted_sections:
+        if s.error:
+            failed_lines.append(f"- **{s.title}** — {s.error}")
+            continue
+        rows_json = json.dumps(s.rows_preview or [], default=str, indent=2)
+        section_blocks.append(
+            f"### {s.title}\n"
+            f"Sub-question: {s.sub_question}\n"
+            f"Row count: {s.row_count}\n"
+            f"Section blurb (use this verbatim or paraphrase): {s.summary}\n"
+            f"Sample rows:\n```json\n{rows_json}\n```"
+        )
+
+    user = REPORT_AGGREGATOR_USER.format(
+        question=state["question"],
+        plan_rationale=state.get("report_plan_rationale") or "(not provided)",
+        sections_block="\n\n".join(section_blocks) or "(no sections completed)",
+        failed_sections="\n".join(failed_lines) or "(none)",
+    )
+    msg = await _report_aggregator().ainvoke(
+        [{"role": "system", "content": REPORT_AGGREGATOR_SYSTEM},
+         {"role": "user", "content": user}]
+    )
+    text = msg.content if isinstance(msg.content, str) else "".join(
+        b.get("text", "") for b in msg.content
+        if isinstance(b, dict) and b.get("type") in ("text", "text_delta")
+    )
+    return {
+        "summary": text,
+        "report_text": text,
+        "messages": [AIMessage(content=text)],
     }

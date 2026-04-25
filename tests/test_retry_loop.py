@@ -46,6 +46,7 @@ async def test_retry_recovers_after_validator_rejection():
         patch("agent.nodes._sql_generator", return_value=sql_llm),
         patch("agent.nodes._summarizer", return_value=summary_llm),
         patch("agent.nodes.pagila_schema_string", return_value="<fake schema>"),
+        patch("agent.nodes.vocabulary_string", return_value="<fake vocab>"),
         patch("agent.nodes.run_query", return_value=[{"customer_id": 1}]),
     ):
         final_state = await app_graph.ainvoke(
@@ -108,6 +109,7 @@ async def test_retry_recovers_after_executor_error():
         patch("agent.nodes._sql_generator", return_value=sql_llm),
         patch("agent.nodes._summarizer", return_value=summary_llm),
         patch("agent.nodes.pagila_schema_string", return_value="<fake schema>"),
+        patch("agent.nodes.vocabulary_string", return_value="<fake vocab>"),
         patch("agent.nodes.run_query", side_effect=fake_run_query),
     ):
         final_state = await app_graph.ainvoke(
@@ -145,6 +147,7 @@ async def test_retry_exhaustion_routes_to_summarize_with_error():
         patch("agent.nodes._sql_generator", return_value=sql_llm),
         patch("agent.nodes._summarizer", return_value=summary_llm),
         patch("agent.nodes.pagila_schema_string", return_value="<fake schema>"),
+        patch("agent.nodes.vocabulary_string", return_value="<fake vocab>"),
         patch("agent.nodes.run_query", return_value=[]),
     ):
         final_state = await app_graph.ainvoke(
@@ -179,6 +182,7 @@ async def test_first_attempt_prompt_has_no_retry_hint():
         patch("agent.nodes._sql_generator", return_value=sql_llm),
         patch("agent.nodes._summarizer", return_value=summary_llm),
         patch("agent.nodes.pagila_schema_string", return_value="<fake schema>"),
+        patch("agent.nodes.vocabulary_string", return_value="<fake vocab>"),
         patch("agent.nodes.run_query", return_value=[{"customer_id": 1}]),
     ):
         await app_graph.ainvoke(
