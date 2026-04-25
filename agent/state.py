@@ -12,8 +12,9 @@ class ChartSpec(BaseModel):
 
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
-    question: str
-    intent: Literal["data", "chat", "unclear"] | None
+    question: str                    # current turn's raw user input
+    intent: Literal["data", "respond"] | None
+    data_question: str | None        # front agent's refined, self-contained restatement for SQL gen
     sql: str | None
     sql_error: str | None
     rows: list[dict] | None
@@ -22,12 +23,17 @@ class AgentState(TypedDict):
     retries: int
 
 
-def initial_state(question: str) -> AgentState:
-    """Seed state for a fresh turn."""
+def turn_input(question: str, human_message: BaseMessage) -> dict:
+    """Per-turn delta to merge into checkpointed state.
+
+    `messages` is appended via add_messages reducer so history accumulates.
+    Other fields are reset so prior-turn values don't leak.
+    """
     return {
-        "messages": [],
+        "messages": [human_message],
         "question": question,
         "intent": None,
+        "data_question": None,
         "sql": None,
         "sql_error": None,
         "rows": None,

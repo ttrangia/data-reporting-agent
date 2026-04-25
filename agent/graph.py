@@ -4,14 +4,14 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from agent.state import AgentState
 from agent.nodes import (
-    classify_intent, generate_sql, validate_sql,
-    execute_sql, summarize, handle_chat,
+    front_agent, generate_sql, validate_sql,
+    execute_sql, summarize,
     MAX_RETRIES,
 )
 
 
-def after_intent(state: AgentState) -> str:
-    return "generate_sql" if state["intent"] == "data" else "handle_chat"
+def after_front(state: AgentState) -> str:
+    return "generate_sql" if state["intent"] == "data" else "END"
 
 
 def after_validate(state: AgentState) -> str:
@@ -32,17 +32,16 @@ def after_execute(state: AgentState) -> str:
 
 def build_graph():
     g = StateGraph(AgentState)
-    g.add_node("classify_intent", classify_intent)
+    g.add_node("front_agent", front_agent)
     g.add_node("generate_sql", generate_sql)
     g.add_node("validate_sql", validate_sql)
     g.add_node("execute_sql", execute_sql)
     g.add_node("summarize", summarize)
-    g.add_node("handle_chat", handle_chat)
 
-    g.set_entry_point("classify_intent")
-    g.add_conditional_edges("classify_intent", after_intent, {
+    g.set_entry_point("front_agent")
+    g.add_conditional_edges("front_agent", after_front, {
         "generate_sql": "generate_sql",
-        "handle_chat": "handle_chat",
+        "END": END,
     })
     g.add_edge("generate_sql", "validate_sql")
     g.add_conditional_edges("validate_sql", after_validate, {
@@ -55,7 +54,6 @@ def build_graph():
         "summarize": "summarize",
     })
     g.add_edge("summarize", END)
-    g.add_edge("handle_chat", END)
 
     return g.compile(checkpointer=MemorySaver())
 
