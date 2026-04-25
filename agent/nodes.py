@@ -31,6 +31,28 @@ HISTORY_TURN_LIMIT = 12   # last N messages shown to front agent
 CHART_ROW_BUDGET = 20     # rows shown to chart picker — enough to see shape, cheap to send
 
 
+def _cached_system(text: str) -> dict:
+    """System message with Anthropic prompt caching enabled.
+
+    Marks the entire system prompt as cacheable. First call within a 5-minute
+    window pays a ~25% write premium on cached tokens; subsequent reads are
+    ~10% of normal input cost. Cache hits show up as `cache_read_input_tokens`
+    in the response usage metadata.
+
+    Only worth using on prompts >= 1024 tokens (Anthropic's caching minimum) —
+    smaller prompts ignore the cache_control marker. Used here on the
+    FRONT_AGENT and SQL_GENERATION system prompts (both well over threshold).
+    The schema string alone is ~6.7K tokens; caching it eliminates the
+    dominant repeat cost on every data-path turn.
+    """
+    return {
+        "role": "system",
+        "content": [
+            {"type": "text", "text": text, "cache_control": {"type": "ephemeral"}},
+        ],
+    }
+
+
 @cache
 def _front_agent_llm():
     llm = ChatAnthropic(model="claude-sonnet-4-5", temperature=0)
@@ -105,7 +127,7 @@ def front_agent(state: AgentState) -> dict:
         question=state["question"],
     )
     decision: FrontAgentDecision = _front_agent_llm().invoke(
-        [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        [_cached_system(system), {"role": "user", "content": user}]
     )
 
     if decision.intent == "data":
@@ -145,8 +167,10 @@ def generate_sql(state: AgentState) -> dict:
     )
     user = SQL_GENERATION_USER.format(retry_context=retry_context, question=question)
 
+    # System prompt (incl. ~6.7K-token schema) is fully stable across calls →
+    # cache it. Variable retry context lives in the user message, uncached.
     result: SQLGeneration = _sql_generator().invoke(
-        [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        [_cached_system(system), {"role": "user", "content": user}]
     )
     # Clear sql_error so a passing validate_sql doesn't see stale state from prior turn
     return {"sql": result.sql, "sql_error": None}
