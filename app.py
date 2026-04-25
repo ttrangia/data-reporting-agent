@@ -39,22 +39,30 @@ def _format_rows_table(rows: list[dict]) -> str:
 
 
 # Pipeline nodes that get their own cl.Step. summarize is excluded — its prose
-# streams directly into the user-facing cl.Message. generate_chart runs after
-# summarize, so its Step naturally appears below the streamed answer.
+# streams directly into the user-facing cl.Message.
+#
+# To surface a NEW graph node in the UI:
+#   1. Add a `name → friendly label` entry to NODE_LABEL.
+#   2. Add a `name → lucide icon name` entry to NODE_ICON.
+#   3. (Optional) Add a branch in `_step_body` for custom output formatting.
+#      If you skip this, the generic fallback renders the state-update fields
+#      as a key/value list — informative but unstyled.
 NODE_LABEL = {
-    "front_agent":   "Understanding the question",
-    "generate_sql":  "Generating SQL",
-    "validate_sql":  "Validating query",
-    "execute_sql":   "Executing on Postgres",
-    "generate_chart":"Designing chart",
+    "front_agent":    "Understanding the question",
+    "generate_sql":   "Generating SQL",
+    "validate_sql":   "Validating query",
+    "execute_sql":    "Executing on Postgres",
+    "diagnose_empty": "Investigating empty result",
+    "generate_chart": "Designing chart",
 }
 
 NODE_ICON = {
-    "front_agent":   "brain",
-    "generate_sql":  "code-2",
-    "validate_sql":  "shield-check",
-    "execute_sql":   "database",
-    "generate_chart":"chart-bar",
+    "front_agent":    "brain",
+    "generate_sql":   "code-2",
+    "validate_sql":   "shield-check",
+    "execute_sql":    "database",
+    "diagnose_empty": "search-check",
+    "generate_chart": "chart-bar",
 }
 
 
@@ -79,9 +87,58 @@ def _step_body(node: str, output: dict) -> str:
         if rows:
             body += f"\n\n{_format_rows_table(rows)}"
         return body
+    if node == "diagnose_empty":
+        return _diagnose_step_body(output)
     if node == "generate_chart":
         return _chart_step_body(output.get("chart"))
-    return ""
+    # Fallback for any node added to NODE_LABEL without a custom branch above.
+    return _generic_step_body(output)
+
+
+def _diagnose_step_body(output: dict) -> str:
+    """Step body for diagnose_empty. Shows the diagnostic SQL + its rows so
+    the user can see exactly how the agent investigated the empty result."""
+    sql = output.get("diagnostic_sql")
+    rows = output.get("diagnostic_rows")
+    if not sql:
+        return "_No diagnostic was produced — query failed too quickly to investigate, or the LLM declined._"
+    body = (
+        "Main query returned 0 rows. Ran a diagnostic to surface what values "
+        "DO have data:\n\n"
+        f"```sql\n{sql}\n```"
+    )
+    if rows is not None:
+        body += f"\n\n**{len(rows)}** diagnostic row(s)."
+        if rows:
+            body += f"\n\n{_format_rows_table(rows)}"
+    return body
+
+
+def _generic_step_body(output: dict) -> str:
+    """Default formatter for any graph node that doesn't have a dedicated
+    branch above. Renders non-null state-update fields as a compact list.
+    Means a new node added to NODE_LABEL gets visible content immediately,
+    even before custom formatting is written."""
+    if not output:
+        return "_(no output)_"
+    parts = []
+    for k, v in output.items():
+        if v is None:
+            continue
+        if isinstance(v, bool):
+            parts.append(f"- **{k}**: `{v}`")
+        elif isinstance(v, (int, float)):
+            parts.append(f"- **{k}**: `{v}`")
+        elif isinstance(v, str):
+            preview = v if len(v) <= 200 else v[:200] + "…"
+            parts.append(f"- **{k}**: `{preview}`")
+        elif isinstance(v, list):
+            parts.append(f"- **{k}**: list[{len(v)}]")
+        elif isinstance(v, dict):
+            parts.append(f"- **{k}**: dict[{len(v)}]")
+        else:
+            parts.append(f"- **{k}**: `{type(v).__name__}`")
+    return "\n".join(parts) if parts else "_(no fields set)_"
 
 
 def _chart_step_body(chart) -> str:
@@ -113,16 +170,41 @@ async def _stream_smoothed(msg: cl.Message, text: str) -> None:
 
 def _build_chart(spec: ChartSpec, rows: list[dict]):
     """Build a Plotly figure from a ChartSpec + rows. Returns None if the spec
-    is unrenderable (kind="none"/"table", missing rows, missing columns)."""
+    is unrenderable (kind="none"/"table", missing rows, missing columns).
+
+    Honors layout knobs on bar/line: barmode, orientation, facet_col, sort_by.
+    Silently skips a knob if it's malformed (e.g., facet_col not in df.columns)
+    rather than failing the whole chart — the 2D base chart is still useful.
+    """
     if not rows or spec.kind in (None, "none", "table"):
         return None
     df = pd.DataFrame(rows)
+
+    # Sort the dataframe if a sort column was specified.
+    if spec.sort_by and spec.sort_by in df.columns:
+        df = df.sort_values(spec.sort_by, ascending=not bool(spec.sort_desc))
+
     title = spec.title or ""
+    color = spec.group if spec.kind in ("bar", "line") and spec.group in df.columns else None
+    facet_col = spec.facet_col if spec.kind in ("bar", "line") and spec.facet_col in df.columns else None
+    orientation = spec.orientation or "v"
+
+    # Default barmode: "group" if a color dimension exists, otherwise relative.
+    barmode = spec.barmode or ("group" if color else "relative")
+
     try:
         if spec.kind == "bar":
-            return px.bar(df, x=spec.x, y=spec.y, title=title)
+            return px.bar(
+                df, x=spec.x, y=spec.y,
+                color=color, facet_col=facet_col,
+                title=title, barmode=barmode, orientation=orientation,
+            )
         if spec.kind == "line":
-            return px.line(df, x=spec.x, y=spec.y, title=title, markers=True)
+            return px.line(
+                df, x=spec.x, y=spec.y,
+                color=color, facet_col=facet_col,
+                title=title, markers=True, orientation=orientation,
+            )
         if spec.kind == "pie":
             return px.pie(df, names=spec.x, values=spec.y, title=title)
     except Exception:
@@ -167,6 +249,7 @@ async def on_message(message: cl.Message):
     summary_from_state: str | None = None
     rows_for_chart: list[dict] = []
     chart_spec: ChartSpec | None = None
+    fa_intent: str | None = None  # captured from front_agent's on_chain_end
 
     try:
         async for ev in app_graph.astream_events(
@@ -210,8 +293,10 @@ async def on_message(message: cl.Message):
                     if step is not None:
                         step.output = _step_body(name, output)
                         await step.update()
-                    if name == "front_agent" and output.get("intent") in ("respond", "rechart"):
-                        summary_from_state = output.get("summary")
+                    if name == "front_agent":
+                        fa_intent = output.get("intent")
+                        if fa_intent in ("respond", "rechart"):
+                            summary_from_state = output.get("summary")
                     if name == "execute_sql" and output.get("rows"):
                         rows_for_chart = output["rows"]
                     if name == "generate_chart" and output.get("chart"):
@@ -237,17 +322,30 @@ async def on_message(message: cl.Message):
     if not final_answer.content:
         final_answer.content = "_(no response produced)_"
 
-    # Attach a chart to the final answer when one was suggested.
-    # On the rechart path, execute_sql didn't fire this turn, so rows_for_chart
-    # is empty — pull the persisted rows from the checkpointed state.
-    if chart_spec is not None:
-        if not rows_for_chart:
-            snapshot = await app_graph.aget_state(config)
-            rows_for_chart = snapshot.values.get("rows") or []
+    # If we'll need rows for either a chart or the inline-table fallback and
+    # didn't see them this turn (rechart path skips execute_sql), pull from
+    # checkpointed state. Cheap with MemorySaver.
+    if not rows_for_chart and fa_intent in ("data", "rechart"):
+        snapshot = await app_graph.aget_state(config)
+        rows_for_chart = snapshot.values.get("rows") or []
+
+    # Attach a chart when one was produced. Track whether it actually rendered
+    # — kind="none"/"table" or invalid column shapes leave fig=None.
+    chart_attached = False
+    if chart_spec is not None and rows_for_chart:
         fig = _build_chart(chart_spec, rows_for_chart)
         if fig is not None:
             final_answer.elements = [
                 cl.Plotly(name="chart", figure=fig, display="inline")
             ]
+            chart_attached = True
+
+    # Inline table fallback: data/rechart turns where no chart rendered should
+    # still show the rows in the message body, not just buried in the
+    # execute_sql Step (which is collapsed by default).
+    if not chart_attached and rows_for_chart and fa_intent in ("data", "rechart"):
+        body = (final_answer.content or "").rstrip()
+        table = _format_rows_table(rows_for_chart)
+        final_answer.content = (body + "\n\n**Data**\n\n" + table) if body else ("**Data**\n\n" + table)
 
     await final_answer.send()

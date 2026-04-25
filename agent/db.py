@@ -86,6 +86,65 @@ def pagila_schema_string() -> str:
     return _with_cold_start_retry(lambda: agent_db().get_table_info())
 
 
+# (Table, column) pairs to pre-enumerate at boot. Picked for low cardinality
+# (< ~200 distinct values) and high "WHERE clause" usefulness — exactly the
+# values a SQL generator is most likely to misspell or hallucinate ("United
+# States" vs the actual canonical spelling, "Action" vs "action" category,
+# etc.). The 3-sample-row schema dump can't surface these.
+_VOCABULARY_COLUMNS: list[tuple[str, str]] = [
+    ("country",  "country"),
+    ("category", "name"),
+    ("language", "name"),
+    ("film",     "rating"),
+    ("film",     "rental_rate"),
+]
+
+
+@cache
+def low_cardinality_vocab() -> dict[str, list[str]]:
+    """Distinct values for each (table, column) in _VOCABULARY_COLUMNS.
+
+    Loaded once at boot, cached for the process lifetime. Lets the SQL
+    generator use exact spellings in WHERE clauses instead of guessing.
+    Returns a dict keyed by 'table.column' → sorted list of stringified values.
+    Skips a column silently on error rather than failing the whole load."""
+    def _load() -> dict[str, list[str]]:
+        result: dict[str, list[str]] = {}
+        with agent_engine().connect() as conn:
+            for table, col in _VOCABULARY_COLUMNS:
+                try:
+                    rows = conn.execute(text(
+                        f'SELECT DISTINCT "{col}" AS v FROM "{table}" '
+                        f'WHERE "{col}" IS NOT NULL ORDER BY "{col}"'
+                    )).all()
+                    result[f"{table}.{col}"] = [str(r.v) for r in rows]
+                except Exception as e:
+                    logger.warning("Skipping vocab for %s.%s: %s", table, col, e)
+        return result
+    return _with_cold_start_retry(_load)
+
+
+@cache
+def vocabulary_string() -> str:
+    """Format low_cardinality_vocab() as a markdown block for prompt injection.
+
+    Lists ALL values for each enumerated column — even ~109 countries fits
+    comfortably in the prompt-cached static prefix. Better to list everything
+    than to truncate and risk the value the user wants being hidden."""
+    vocab = low_cardinality_vocab()
+    if not vocab:
+        return ""
+    lines = [
+        "Known categorical values in the data — use these EXACT spellings in WHERE clauses, do not guess:",
+        "",
+    ]
+    for col, values in vocab.items():
+        n = len(values)
+        joined = ", ".join(f'"{v}"' for v in values)
+        lines.append(f"- `{col}` ({n} distinct value{'s' if n != 1 else ''}): {joined}")
+    return "\n".join(lines)
+
+
 def run_query(sql: str) -> list[dict]:
     def _run():
         with agent_engine().connect() as conn:
@@ -110,3 +169,4 @@ def warmup() -> None:
     """Wake Neon and prime caches so the first user query is fast."""
     verify_connection()
     pagila_schema_string()
+    vocabulary_string()  # also prime the categorical-vocab cache

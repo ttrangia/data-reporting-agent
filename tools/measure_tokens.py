@@ -9,7 +9,7 @@ load_dotenv()
 
 from anthropic import Anthropic
 
-from agent.db import pagila_schema_string
+from agent.db import pagila_schema_string, vocabulary_string
 from agent.prompts import (
     CHART_FORCE_NOTE,
     CHART_SPEC_SYSTEM,
@@ -47,6 +47,7 @@ def cost_per_1k_calls(tokens: int) -> str:
 
 def main() -> None:
     schema = pagila_schema_string()
+    vocab = vocabulary_string()
 
     print(f"\nModel: {MODEL}")
     print(f"Pricing assumed: ${PRICE_PER_M_INPUT}/M input tokens")
@@ -55,6 +56,7 @@ def main() -> None:
     # --- Component-level (raw chunks) ---
     components = [
         ("Pagila schema (DDL + 3 sample rows × 22 tables)", schema),
+        ("Vocabulary (categorical values)",                  vocab),
         ("DATASET_NOTES",                                    DATASET_NOTES),
         ("FRONT_AGENT_SYSTEM template",                      FRONT_AGENT_SYSTEM),
         ("SQL_GENERATION_SYSTEM template",                   SQL_GENERATION_SYSTEM),
@@ -79,9 +81,9 @@ def main() -> None:
         ("front_agent system",
          FRONT_AGENT_SYSTEM.format(dataset_notes=DATASET_NOTES)),
         ("generate_sql system (no retry)",
-         SQL_GENERATION_SYSTEM.format(dataset_notes=DATASET_NOTES, schema=schema)),
+         SQL_GENERATION_SYSTEM.format(dataset_notes=DATASET_NOTES, vocabulary=vocab, schema=schema)),
         ("generate_sql system (retry: +hint with prior SQL & error)",
-         SQL_GENERATION_SYSTEM.format(dataset_notes=DATASET_NOTES, schema=schema)
+         SQL_GENERATION_SYSTEM.format(dataset_notes=DATASET_NOTES, vocabulary=vocab, schema=schema)
          + SQL_GENERATION_RETRY_HINT.format(prior_sql="-- 200 char SQL --", prior_error="-- 200 char error --")),
         ("summarize system",
          SUMMARIZE_SYSTEM.format(dataset_notes=DATASET_NOTES)),
@@ -103,7 +105,7 @@ def main() -> None:
     print()
 
     front_assembled  = FRONT_AGENT_SYSTEM.format(dataset_notes=DATASET_NOTES)
-    sql_assembled    = SQL_GENERATION_SYSTEM.format(dataset_notes=DATASET_NOTES, schema=schema)
+    sql_assembled    = SQL_GENERATION_SYSTEM.format(dataset_notes=DATASET_NOTES, vocabulary=vocab, schema=schema)
     sumr_assembled   = SUMMARIZE_SYSTEM.format(dataset_notes=DATASET_NOTES)
     chart_assembled  = CHART_SPEC_SYSTEM
 

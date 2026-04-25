@@ -5,7 +5,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from agent.state import AgentState
 from agent.nodes import (
     front_agent, generate_sql, validate_sql,
-    execute_sql, summarize, generate_chart,
+    execute_sql, diagnose_empty, summarize, generate_chart,
     MAX_RETRIES,
 )
 
@@ -32,6 +32,9 @@ def after_execute(state: AgentState) -> str:
         if state["retries"] >= MAX_RETRIES:
             return "summarize"
         return "generate_sql"
+    # Successful execute but 0 rows → run diagnostic before summarizing
+    if not state.get("rows"):
+        return "diagnose_empty"
     return "summarize"
 
 
@@ -41,6 +44,7 @@ def build_graph():
     g.add_node("generate_sql", generate_sql)
     g.add_node("validate_sql", validate_sql)
     g.add_node("execute_sql", execute_sql)
+    g.add_node("diagnose_empty", diagnose_empty)
     g.add_node("summarize", summarize)
     g.add_node("generate_chart", generate_chart)
 
@@ -58,8 +62,10 @@ def build_graph():
     })
     g.add_conditional_edges("execute_sql", after_execute, {
         "generate_sql": "generate_sql",
+        "diagnose_empty": "diagnose_empty",
         "summarize": "summarize",
     })
+    g.add_edge("diagnose_empty", "summarize")
     g.add_edge("summarize", "generate_chart")
     g.add_edge("generate_chart", END)
 

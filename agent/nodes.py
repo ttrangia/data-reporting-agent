@@ -5,13 +5,16 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from sqlalchemy.exc import DBAPIError, OperationalError
 
-from agent.db import pagila_schema_string, run_query
+from agent.db import pagila_schema_string, run_query, vocabulary_string
 from agent.chart_directive import detect as detect_chart_directive
 from agent.prompts import (
     CHART_FORCE_NOTE,
     CHART_SPEC_SYSTEM,
     CHART_SPEC_USER,
     DATASET_NOTES,
+    DIAGNOSE_EMPTY_SYSTEM,
+    DIAGNOSE_EMPTY_USER,
+    RECHART_USER,
     FRONT_AGENT_SYSTEM,
     FRONT_AGENT_USER,
     SQL_GENERATION_RETRY_HINT,
@@ -55,25 +58,25 @@ def _cached_system(text: str) -> dict:
 
 @cache
 def _front_agent_llm():
-    llm = ChatAnthropic(model="claude-sonnet-4-5", temperature=0)
+    llm = ChatAnthropic(model="claude-sonnet-4-6", temperature=0)
     return llm.with_structured_output(FrontAgentDecision)
 
 
 @cache
 def _sql_generator():
-    llm = ChatAnthropic(model="claude-sonnet-4-5", temperature=0)
+    llm = ChatAnthropic(model="claude-sonnet-4-6", temperature=0)
     return llm.with_structured_output(SQLGeneration)
 
 
 @cache
 def _summarizer():
     # Plain LLM (no structured output) so token streaming has clean text chunks
-    return ChatAnthropic(model="claude-sonnet-4-5", temperature=0)
+    return ChatAnthropic(model="claude-haiku-4-5-20251001", temperature=0)
 
 
 @cache
 def _chart_picker():
-    llm = ChatAnthropic(model="claude-sonnet-4-5", temperature=0)
+    llm = ChatAnthropic(model="claude-sonnet-4-6", temperature=0)
     return llm.with_structured_output(ChartSpec)
 
 
@@ -163,6 +166,7 @@ def generate_sql(state: AgentState) -> dict:
 
     system = SQL_GENERATION_SYSTEM.format(
         dataset_notes=DATASET_NOTES,
+        vocabulary=vocabulary_string(),
         schema=pagila_schema_string(),
     )
     user = SQL_GENERATION_USER.format(retry_context=retry_context, question=question)
@@ -244,65 +248,115 @@ def _force_default_spec(rows: list[dict], question: str) -> ChartSpec:
     )
 
 
-def generate_chart(state: AgentState) -> dict:
-    """Pick a visualization for the result rows. Runs after summarize on the data path.
+def _validate_chart_spec(spec: ChartSpec, columns: list[str]) -> ChartSpec:
+    """Drop bogus column refs and unsupported layout knobs, in place."""
+    if spec.kind == "pie":
+        # Pie ignores all the layout knobs except title/x/y.
+        spec.group = None
+        spec.barmode = None
+        spec.orientation = None
+        spec.facet_col = None
+        spec.sort_by = None
+        spec.sort_desc = None
+    elif spec.kind in ("bar", "line"):
+        if spec.group and spec.group not in columns:
+            spec.group = None
+        if spec.facet_col and spec.facet_col not in columns:
+            spec.facet_col = None
+        if spec.sort_by and spec.sort_by not in columns:
+            spec.sort_by = None
+            spec.sort_desc = None
+        # line doesn't use barmode
+        if spec.kind == "line":
+            spec.barmode = None
+    else:
+        # none/table — all layout knobs irrelevant
+        spec.group = None
+        spec.barmode = None
+        spec.orientation = None
+        spec.facet_col = None
+        spec.sort_by = None
+        spec.sort_desc = None
+    return spec
 
-    Three modes driven by the user's raw question:
-      - "skip"  — user explicitly said no chart → return None, no LLM call
-      - "force" — user explicitly asked for a chart → LLM must pick one;
-                  if it picks "none" anyway, fall back to a deterministic default
-      - "auto"  — silent on charts → current heuristic (LLM picks; pre-filter
-                  out trivial cases like single rows)
+
+def generate_chart(state: AgentState) -> dict:
+    """Pick a visualization for the result rows.
+
+    Two flows depending on whether this is a fresh data turn or a rechart turn:
+
+    - **Data turn** (intent="data" or no intent): chart picker emits a fresh
+      spec. Honors the user-message chart directive (skip / force / auto).
+    - **Rechart turn** (intent="rechart"): picker is called AGAIN with the
+      prior chart spec + the user's modification request in the prompt.
+      Lets the LLM apply arbitrary edits ("switch x", "color by genre",
+      "swap axes", etc.), not just kind changes.
+
+    Two deterministic fast paths skip the LLM entirely:
+    - sql_error or no rows → no chart
+    - chart_kind_override == "table" → user wants no chart at all
     """
     rows = state.get("rows") or []
-
     if state.get("sql_error") or not rows:
         return {"chart": None}
 
-    # Explicit kind override (set by front_agent on the rechart path) wins —
-    # deterministic, no LLM call. "table" means the user wants no chart.
+    intent = state.get("intent")
     override = state.get("chart_kind_override")
-    if override:
-        if override == "table":
-            return {"chart": None}
-        # On rechart, the prior chart's x/y/title are the right source —
-        # the title was crafted as a descriptive caption for THIS data on
-        # the original turn. The current turn's `question` is literally
-        # the rechart command ("replot as pie") — useless as a caption.
+
+    # Fast path: user explicitly wants table view, no chart.
+    if override == "table":
+        return {"chart": None}
+
+    columns = list(rows[0].keys())
+    sample = rows[:CHART_ROW_BUDGET]
+
+    # ── Rechart path ──────────────────────────────────────────────
+    if intent == "rechart":
         prior = state.get("chart")
-        if prior and prior.x and prior.y:
-            spec = ChartSpec(
-                kind=override,
-                x=prior.x,
-                y=prior.y,
-                title=prior.title or _force_default_spec(
-                    rows, state.get("data_question") or state["question"]
-                ).title,
-                reasoning=f"User requested a {override} chart; reusing prior axes/title.",
-            )
-        else:
-            # No prior chart (first-turn force, or prior was unchartable).
-            # Use the original meaningful question, never the rechart command.
-            spec = _force_default_spec(
-                rows, state.get("data_question") or state["question"]
-            )
-            spec.kind = override
-            spec.reasoning = f"User explicitly requested a {override} chart."
+        user = RECHART_USER.format(
+            data_question=state.get("data_question") or "(unknown)",
+            question=state.get("question") or "(no message)",
+            prior_kind=prior.kind if prior else "(none)",
+            prior_x=prior.x if prior else "(none)",
+            prior_y=prior.y if prior else "(none)",
+            prior_group=prior.group if prior else "(none)",
+            prior_title=prior.title if prior else "(none)",
+            prior_barmode=prior.barmode if prior else "(none)",
+            prior_orientation=prior.orientation if prior else "(none)",
+            prior_facet_col=prior.facet_col if prior else "(none)",
+            prior_sort_by=prior.sort_by if prior else "(none)",
+            prior_sort_desc=prior.sort_desc if prior else "(none)",
+            kind_hint=override or "(none)",
+            columns=", ".join(columns),
+            n_total=len(rows),
+            n_shown=len(sample),
+            rows_json=json.dumps(sample, default=str, indent=2),
+        )
+        spec: ChartSpec = _chart_picker().invoke(
+            [{"role": "system", "content": CHART_SPEC_SYSTEM},
+             {"role": "user", "content": user}]
+        )
+        # On rechart, if the picker produces invalid columns, fall back to
+        # the prior chart unchanged rather than erasing the user's chart.
+        if spec.kind in ("bar", "line", "pie"):
+            if spec.x not in columns or spec.y not in columns:
+                if prior is not None:
+                    return {"chart": prior}
+                return {"chart": None}
+        spec = _validate_chart_spec(spec, columns)
+        if spec.kind in ("none", "table"):
+            return {"chart": None}
         return {"chart": spec}
 
+    # ── Data turn path (unchanged) ────────────────────────────────
     raw_question = state.get("question") or ""
     directive = detect_chart_directive(raw_question)
 
     if directive == "skip":
         return {"chart": None}
-
-    # Auto-mode skips trivially small results. Force-mode does not — if the
-    # user asked for a chart of one row, we'll still try.
     if directive == "auto" and len(rows) == 1:
         return {"chart": None}
 
-    columns = list(rows[0].keys())
-    sample = rows[:CHART_ROW_BUDGET]
     user = CHART_SPEC_USER.format(
         directive_note=CHART_FORCE_NOTE if directive == "force" else "",
         question=state.get("data_question") or state["question"],
@@ -311,27 +365,82 @@ def generate_chart(state: AgentState) -> dict:
         n_shown=len(sample),
         rows_json=json.dumps(sample, default=str, indent=2),
     )
-    spec: ChartSpec = _chart_picker().invoke(
-        [{"role": "system", "content": CHART_SPEC_SYSTEM}, {"role": "user", "content": user}]
+    spec = _chart_picker().invoke(
+        [{"role": "system", "content": CHART_SPEC_SYSTEM},
+         {"role": "user", "content": user}]
     )
 
-    # Validate the LLM's column choices against the actual result columns —
-    # the prompt forbids invented names, but verify deterministically.
     if spec.kind in ("bar", "line", "pie"):
         if spec.x not in columns or spec.y not in columns:
             if directive == "force":
                 spec = _force_default_spec(rows, state.get("data_question") or state["question"])
             else:
                 return {"chart": None}
+    spec = _validate_chart_spec(spec, columns)
 
-    # Force override: if the LLM still picked "none"/"table" despite the
-    # explicit instruction, coerce to a default chart.
     if spec.kind in ("none", "table") and directive == "force":
         spec = _force_default_spec(rows, state.get("data_question") or state["question"])
 
     if spec.kind == "none":
         return {"chart": None}
     return {"chart": spec}
+
+
+def diagnose_empty(state: AgentState) -> dict:
+    """Run a diagnostic when execute_sql succeeded with 0 rows.
+
+    Generates a follow-up SQL via the SQL-gen LLM (different prompt) that
+    surfaces what values DO exist in the data the user was filtering on.
+    Goes through sql_guard like any other query — read-only fence preserved.
+    Failures (LLM error, guard rejection, executor error) degrade silently:
+    summarize handles missing diagnostic gracefully.
+    """
+    # Only run for "real empty" — sql_error or rows already present means skip.
+    if state.get("sql_error") or state.get("rows"):
+        return {"diagnostic_sql": None, "diagnostic_rows": None}
+
+    user = DIAGNOSE_EMPTY_USER.format(
+        question=state.get("data_question") or state["question"],
+        sql=state.get("sql") or "",
+        vocabulary=vocabulary_string(),
+        schema=pagila_schema_string(),
+    )
+    try:
+        diag: SQLGeneration = _sql_generator().invoke(
+            [_cached_system(DIAGNOSE_EMPTY_SYSTEM),
+             {"role": "user", "content": user}]
+        )
+    except Exception:
+        return {"diagnostic_sql": None, "diagnostic_rows": None}
+
+    try:
+        canonical = guard(diag.sql)
+    except ValueError:
+        return {"diagnostic_sql": None, "diagnostic_rows": None}
+
+    try:
+        rows = run_query(canonical)
+    except Exception:
+        return {"diagnostic_sql": None, "diagnostic_rows": None}
+
+    # Cap diagnostic rows for prompt cost
+    return {"diagnostic_sql": canonical, "diagnostic_rows": rows[:20]}
+
+
+def _diagnostic_block(diag_sql: str | None, diag_rows: list[dict] | None) -> str:
+    """Markdown-formatted diagnostic block to inject into SUMMARIZE_USER.
+    Empty string when there's no diagnostic to surface."""
+    if not diag_sql or diag_rows is None:
+        return ""
+    if not diag_rows:
+        return "\n\nDiagnostic ran but returned no rows either — the data may be empty more broadly."
+    payload = json.dumps(diag_rows, default=str, indent=2)
+    return (
+        "\n\nThe main query returned 0 rows. We ran a diagnostic to surface "
+        "what values DO have data in this context:\n\n"
+        f"```sql\n{diag_sql}\n```\n\n"
+        f"Diagnostic results ({len(diag_rows)} rows):\n```json\n{payload}\n```"
+    )
 
 
 async def summarize(state: AgentState) -> dict:
@@ -343,6 +452,9 @@ async def summarize(state: AgentState) -> dict:
         question=question,
         sql=state.get("sql") or "(no SQL was generated)",
         rows_block=_rows_block(state.get("rows"), state.get("sql_error")),
+        diagnostic_block=_diagnostic_block(
+            state.get("diagnostic_sql"), state.get("diagnostic_rows")
+        ),
     )
     msg = await _summarizer().ainvoke(
         [{"role": "system", "content": system}, {"role": "user", "content": user}]

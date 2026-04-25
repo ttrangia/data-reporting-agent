@@ -8,8 +8,18 @@ class ChartSpec(BaseModel):
     kind: Literal["bar", "line", "pie", "table", "none"]
     x: str | None = None       # column for category / time axis
     y: str | None = None       # column for the numeric measure
+    group: str | None = None   # optional 3rd column for color grouping (bar/line only)
     title: str | None = None
     reasoning: str | None = None
+
+    # Layout knobs — expose just enough plotly express args to handle common
+    # user follow-ups like "stack the bars", "make it horizontal", "facet per genre",
+    # "sort by count". All optional; bar/line only (pie ignores them).
+    barmode: Literal["group", "stack", "relative", "overlay"] | None = None
+    orientation: Literal["v", "h"] | None = None
+    facet_col: str | None = None       # subplot dimension (column from result)
+    sort_by: str | None = None         # column to sort x-axis by
+    sort_desc: bool | None = None      # True for descending
 
 
 class AgentState(TypedDict):
@@ -24,6 +34,11 @@ class AgentState(TypedDict):
     chart: ChartSpec | None
     chart_kind_override: Literal["bar", "line", "pie", "table"] | None
     retries: int
+    # Diagnostic surfaced to summarize when the main query returned 0 rows.
+    # diagnose_empty fills these so the answer can suggest "no rows for X,
+    # but here's what IS available" rather than a flat "no rows".
+    diagnostic_sql: str | None
+    diagnostic_rows: list[dict] | None
 
 
 def turn_input(question: str, human_message: BaseMessage) -> dict:
