@@ -10,12 +10,14 @@ from agent.prompts import (
     DATASET_NOTES,
     FRONT_AGENT_SYSTEM,
     FRONT_AGENT_USER,
+    SQL_GENERATION_RETRY_HINT,
     SQL_GENERATION_SYSTEM,
     SQL_GENERATION_USER,
     SUMMARIZE_SYSTEM,
     SUMMARIZE_USER,
 )
 from agent.schemas import FrontAgentDecision, SQLGeneration
+from agent.sql_guard import guard
 from agent.state import AgentState
 
 MAX_RETRIES = 2
@@ -92,21 +94,40 @@ def front_agent(state: AgentState) -> dict:
 
 def generate_sql(state: AgentState) -> dict:
     question = state.get("data_question") or state["question"]
+
+    # Retry path: include the prior SQL and the specific error so the LLM has
+    # something concrete to fix instead of regenerating from scratch.
+    if state.get("sql_error") and state.get("sql"):
+        retry_context = SQL_GENERATION_RETRY_HINT.format(
+            prior_sql=state["sql"],
+            prior_error=state["sql_error"],
+        )
+    else:
+        retry_context = ""
+
     system = SQL_GENERATION_SYSTEM.format(
         dataset_notes=DATASET_NOTES,
         schema=pagila_schema_string(),
     )
-    user = SQL_GENERATION_USER.format(question=question)
+    user = SQL_GENERATION_USER.format(retry_context=retry_context, question=question)
 
     result: SQLGeneration = _sql_generator().invoke(
         [{"role": "system", "content": system}, {"role": "user", "content": user}]
     )
+    # Clear sql_error so a passing validate_sql doesn't see stale state from prior turn
     return {"sql": result.sql, "sql_error": None}
 
 
 def validate_sql(state: AgentState) -> dict:
-    # Stub: always passes for now
-    return {"sql": state["sql"], "sql_error": None}
+    """Run sql_guard. Pass canonicalized SQL on success; route to retry on failure."""
+    try:
+        canonical = guard(state["sql"])
+        return {"sql": canonical, "sql_error": None}
+    except ValueError as e:
+        return {
+            "sql_error": f"SQL guard rejected the query: {e}",
+            "retries": state["retries"] + 1,
+        }
 
 
 def execute_sql(state: AgentState) -> dict:
@@ -145,7 +166,9 @@ def execute_sql(state: AgentState) -> dict:
         }
 
 
-def summarize(state: AgentState) -> dict:
+async def summarize(state: AgentState) -> dict:
+    """Async + ainvoke so token-level streaming events propagate when the graph
+    is invoked under astream(stream_mode='messages')."""
     question = state.get("data_question") or state["question"]
     system = SUMMARIZE_SYSTEM.format(dataset_notes=DATASET_NOTES)
     user = SUMMARIZE_USER.format(
@@ -153,11 +176,12 @@ def summarize(state: AgentState) -> dict:
         sql=state.get("sql") or "(no SQL was generated)",
         rows_block=_rows_block(state.get("rows"), state.get("sql_error")),
     )
-    msg = _summarizer().invoke(
+    msg = await _summarizer().ainvoke(
         [{"role": "system", "content": system}, {"role": "user", "content": user}]
     )
     summary_text = msg.content if isinstance(msg.content, str) else "".join(
-        b.get("text", "") for b in msg.content if isinstance(b, dict) and b.get("type") == "text"
+        b.get("text", "") for b in msg.content
+        if isinstance(b, dict) and b.get("type") in ("text", "text_delta")
     )
     return {
         "summary": summary_text,

@@ -1,3 +1,4 @@
+import asyncio
 import os
 from dotenv import load_dotenv
 load_dotenv()  # must come before any imports that read env vars
@@ -9,23 +10,20 @@ from agent.db import warmup
 from agent.graph import app_graph
 from agent.state import turn_input
 
-# Wake Neon and prime the schema cache before the first user message.
 warmup()
+
+
+# Anthropic emits multi-character chunks per stream event. Pacing the
+# rendering at character-level with a small delay smooths the typewriter
+# feel — chunky word-bursts become a uniform glide.
+SMOOTH_STREAM_CHAR_DELAY_S = 0.005   # ~200 chars/sec
+SMOOTH_STREAM_CHUNK_THRESHOLD = 4    # only smooth chunks longer than this
 
 
 PREVIEW_ROWS = 10
 
-# Friendly labels shown in the cl.Step header for each graph node.
-NODE_LABELS = {
-    "front_agent":  "Understanding your question",
-    "generate_sql": "Generating SQL",
-    "validate_sql": "Validating query",
-    "execute_sql":  "Executing on Postgres",
-    "summarize":    "Writing summary",
-}
 
-
-def _format_rows_preview(rows: list[dict] | None) -> str:
+def _format_rows_table(rows: list[dict]) -> str:
     if not rows:
         return "_no rows returned_"
     head = rows[:PREVIEW_ROWS]
@@ -38,43 +36,75 @@ def _format_rows_preview(rows: list[dict] | None) -> str:
     return "\n".join(md) + suffix
 
 
-def _format_node_output(node: str, output: dict) -> str:
-    """Render a node's state-update as a human-readable Step body."""
+# Upstream pipeline nodes — each gets its own cl.Step. summarize is excluded
+# because its prose streams directly into the user-facing cl.Message instead
+# of into a Step body (no point in duplicating the answer).
+NODE_LABEL = {
+    "front_agent":  "Understanding the question",
+    "generate_sql": "Generating SQL",
+    "validate_sql": "Validating query",
+    "execute_sql":  "Executing on Postgres",
+}
+
+NODE_ICON = {
+    "front_agent":  "brain",
+    "generate_sql": "code-2",
+    "validate_sql": "shield-check",
+    "execute_sql":  "database",
+}
+
+
+def _step_body(node: str, output: dict) -> str:
     if node == "front_agent":
         if output.get("intent") == "data":
             dq = output.get("data_question") or "(none)"
-            return f"**Routed to data pipeline.**\n\nRefined question:\n> {dq}"
-        return "**Direct response — no SQL needed.**"
+            return f"_Refined as:_\n\n> {dq}"
+        return "_Direct reply — no SQL needed._"
     if node == "generate_sql":
         sql = output.get("sql") or "(no SQL produced)"
         return f"```sql\n{sql}\n```"
     if node == "validate_sql":
         if output.get("sql_error"):
             return f"❌ {output['sql_error']}"
-        return "✓ Passed"
+        return "_Passed all read-only checks._"
     if node == "execute_sql":
         if output.get("sql_error"):
             return f"❌ {output['sql_error']}"
         rows = output.get("rows") or []
-        body = f"✓ Returned {len(rows)} row(s)"
+        body = f"Returned **{len(rows)}** row(s)."
         if rows:
-            body += f"\n\n{_format_rows_preview(rows)}"
+            body += f"\n\n{_format_rows_table(rows)}"
         return body
-    if node == "summarize":
-        return "✓ Summary written"
-    return "(no output)"
+    return ""
+
+
+async def _stream_smoothed(msg: cl.Message, text: str) -> None:
+    """Pace token rendering at character-level for smoother feel.
+    Anthropic streams multi-char deltas — passing them straight to stream_token
+    looks bursty. Splitting into chars with a tiny delay yields a steadier flow.
+    Short chunks pass through directly to avoid pointless overhead."""
+    if len(text) <= SMOOTH_STREAM_CHUNK_THRESHOLD:
+        await msg.stream_token(text)
+        return
+    for ch in text:
+        await msg.stream_token(ch)
+        await asyncio.sleep(SMOOTH_STREAM_CHAR_DELAY_S)
 
 
 def _extract_text(chunk_content) -> str:
-    """AIMessageChunk.content can be str or a list of content blocks (Anthropic)."""
     if isinstance(chunk_content, str):
         return chunk_content
     if isinstance(chunk_content, list):
-        return "".join(
-            b.get("text", "")
-            for b in chunk_content
-            if isinstance(b, dict) and b.get("type") == "text"
-        )
+        parts = []
+        for b in chunk_content:
+            if isinstance(b, dict):
+                if b.get("type") in ("text", "text_delta") and "text" in b:
+                    parts.append(b["text"])
+                elif "text" in b and isinstance(b["text"], str):
+                    parts.append(b["text"])
+            elif isinstance(b, str):
+                parts.append(b)
+        return "".join(parts)
     return ""
 
 
@@ -92,8 +122,8 @@ async def on_message(message: cl.Message):
     config = {"configurable": {"thread_id": thread_id}}
 
     open_steps: dict[str, cl.Step] = {}
-    summary_msg: cl.Message | None = None
-    final_summary_from_state: str | None = None  # respond-path summary (no streaming)
+    final_answer = cl.Message(content="")
+    summary_from_state: str | None = None
 
     try:
         async for ev in app_graph.astream_events(
@@ -104,49 +134,58 @@ async def on_message(message: cl.Message):
             kind = ev["event"]
             name = ev.get("name")
             meta = ev.get("metadata") or {}
-            node = meta.get("langgraph_node")
+            node_for_metadata = meta.get("langgraph_node")
 
-            # Node lifecycle: open a Step on entry, close it on exit.
-            # We filter on `name in NODE_LABELS` because LangGraph emits
-            # on_chain_start/end for the wrapping graph and other internals too.
-            if kind == "on_chain_start" and name in NODE_LABELS and name not in open_steps:
-                step = cl.Step(name=NODE_LABELS[name], type="tool")
-                await step.send()
-                open_steps[name] = step
-
-            elif kind == "on_chain_end" and name in NODE_LABELS:
-                step = open_steps.pop(name, None)
-                output = ev["data"].get("output") or {}
-                if step is not None:
-                    step.output = _format_node_output(name, output)
-                    await step.update()
-                # Capture the front_agent's response_text for respond-paths
-                # (these don't go through summarize so token streaming doesn't apply)
-                if name == "front_agent" and output.get("intent") == "respond":
-                    final_summary_from_state = output.get("summary")
-
-            # Stream summary tokens token-by-token to the user-facing message.
-            elif kind == "on_chat_model_stream" and node == "summarize":
-                if summary_msg is None:
-                    summary_msg = cl.Message(content="")
-                    await summary_msg.send()
+            # Stream summarize LLM tokens straight into the user-facing message.
+            # No Step for summarize — the streaming message IS its visible output.
+            if kind == "on_chat_model_stream" and node_for_metadata == "summarize":
                 chunk = ev["data"].get("chunk")
                 if chunk is not None:
                     text = _extract_text(chunk.content)
                     if text:
-                        await summary_msg.stream_token(text)
+                        await _stream_smoothed(final_answer, text)
+                continue
+
+            # Lifecycle for the four upstream pipeline nodes.
+            if name in NODE_LABEL:
+                if kind == "on_chain_start" and name not in open_steps:
+                    step = cl.Step(
+                        name=NODE_LABEL[name],
+                        type="run",
+                        default_open=False,
+                    )
+                    icon = NODE_ICON.get(name)
+                    if icon:
+                        step.icon = icon
+                    step.show_input = False
+                    await step.send()
+                    open_steps[name] = step
+
+                elif kind == "on_chain_end":
+                    step = open_steps.pop(name, None)
+                    output = ev["data"].get("output") or {}
+                    if step is not None:
+                        step.output = _step_body(name, output)
+                        await step.update()
+                    if name == "front_agent" and output.get("intent") == "respond":
+                        summary_from_state = output.get("summary")
+
+            # Capture summarize's final state in case streaming missed any tokens
+            elif name == "summarize" and kind == "on_chain_end":
+                output = ev["data"].get("output") or {}
+                if output.get("summary"):
+                    summary_from_state = output["summary"]
 
     except Exception as e:
-        # Close any open steps before surfacing the error
         for step in open_steps.values():
             step.output = f"❌ Aborted: {type(e).__name__}"
             await step.update()
         await cl.Message(content=f"**Graph error:** `{type(e).__name__}: {e}`").send()
         return
 
-    if summary_msg is not None:
-        # Finalize the streamed message — no-op content change, just commits the buffer
-        await summary_msg.update()
-    elif final_summary_from_state:
-        # Respond-path (no summarize node ran); send the front agent's reply as a message
-        await cl.Message(content=final_summary_from_state).send()
+    if not final_answer.content and summary_from_state:
+        final_answer.content = summary_from_state
+    if not final_answer.content:
+        final_answer.content = "_(no response produced)_"
+
+    await final_answer.send()

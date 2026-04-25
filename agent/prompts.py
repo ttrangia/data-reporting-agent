@@ -72,7 +72,31 @@ Schema (DDL + 3 sample rows per table):
 Return your answer via the structured output schema: reasoning, tables_used, sql."""
 
 
-SQL_GENERATION_USER = """Question: {question}"""
+SQL_GENERATION_USER = """{retry_context}Question: {question}"""
+
+
+SQL_GENERATION_RETRY_HINT = """**Retry context — your previous attempt failed.**
+
+Previous SQL:
+```sql
+{prior_sql}
+```
+
+Error returned:
+```
+{prior_error}
+```
+
+Diagnose the root cause, then produce a corrected query. Common causes:
+- Wrong table or column name → re-check the schema below.
+- Type mismatch in JOIN/WHERE → cast or pick the right column.
+- Aggregate without all non-aggregated columns in GROUP BY → fix GROUP BY.
+- Mutation operation (INSERT/UPDATE/DELETE/etc.) anywhere, including inside a CTE → rewrite as a pure SELECT.
+- Multiple statements separated by semicolons → combine into one query.
+- Disallowed function (pg_read_file, dblink, lo_import, etc.) → use only standard query functions.
+
+"""
+
 
 
 SUMMARIZE_SYSTEM = """You translate SQL query results into a clear natural-language answer for a non-technical reader.
