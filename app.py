@@ -4,11 +4,13 @@ from dotenv import load_dotenv
 load_dotenv()  # must come before any imports that read env vars
 
 import chainlit as cl
+import pandas as pd
+import plotly.express as px
 from langchain_core.messages import HumanMessage
 
 from agent.db import warmup
 from agent.graph import app_graph
-from agent.state import turn_input
+from agent.state import ChartSpec, turn_input
 
 warmup()
 
@@ -36,21 +38,23 @@ def _format_rows_table(rows: list[dict]) -> str:
     return "\n".join(md) + suffix
 
 
-# Upstream pipeline nodes — each gets its own cl.Step. summarize is excluded
-# because its prose streams directly into the user-facing cl.Message instead
-# of into a Step body (no point in duplicating the answer).
+# Pipeline nodes that get their own cl.Step. summarize is excluded — its prose
+# streams directly into the user-facing cl.Message. generate_chart runs after
+# summarize, so its Step naturally appears below the streamed answer.
 NODE_LABEL = {
-    "front_agent":  "Understanding the question",
-    "generate_sql": "Generating SQL",
-    "validate_sql": "Validating query",
-    "execute_sql":  "Executing on Postgres",
+    "front_agent":   "Understanding the question",
+    "generate_sql":  "Generating SQL",
+    "validate_sql":  "Validating query",
+    "execute_sql":   "Executing on Postgres",
+    "generate_chart":"Designing chart",
 }
 
 NODE_ICON = {
-    "front_agent":  "brain",
-    "generate_sql": "code-2",
-    "validate_sql": "shield-check",
-    "execute_sql":  "database",
+    "front_agent":   "brain",
+    "generate_sql":  "code-2",
+    "validate_sql":  "shield-check",
+    "execute_sql":   "database",
+    "generate_chart":"chart-bar",
 }
 
 
@@ -75,7 +79,23 @@ def _step_body(node: str, output: dict) -> str:
         if rows:
             body += f"\n\n{_format_rows_table(rows)}"
         return body
+    if node == "generate_chart":
+        return _chart_step_body(output.get("chart"))
     return ""
+
+
+def _chart_step_body(chart) -> str:
+    """Markdown body for the generate_chart Step."""
+    if chart is None:
+        return "_No chart for this result._"
+    lines = [f"**{chart.kind.title()} chart**"]
+    if chart.title:
+        lines.append(f"_{chart.title}_")
+    if chart.x and chart.y:
+        lines.append(f"x = `{chart.x}`  ·  y = `{chart.y}`")
+    if chart.reasoning:
+        lines.append(chart.reasoning)
+    return "\n\n".join(lines)
 
 
 async def _stream_smoothed(msg: cl.Message, text: str) -> None:
@@ -89,6 +109,27 @@ async def _stream_smoothed(msg: cl.Message, text: str) -> None:
     for ch in text:
         await msg.stream_token(ch)
         await asyncio.sleep(SMOOTH_STREAM_CHAR_DELAY_S)
+
+
+def _build_chart(spec: ChartSpec, rows: list[dict]):
+    """Build a Plotly figure from a ChartSpec + rows. Returns None if the spec
+    is unrenderable (kind="none"/"table", missing rows, missing columns)."""
+    if not rows or spec.kind in (None, "none", "table"):
+        return None
+    df = pd.DataFrame(rows)
+    title = spec.title or ""
+    try:
+        if spec.kind == "bar":
+            return px.bar(df, x=spec.x, y=spec.y, title=title)
+        if spec.kind == "line":
+            return px.line(df, x=spec.x, y=spec.y, title=title, markers=True)
+        if spec.kind == "pie":
+            return px.pie(df, names=spec.x, values=spec.y, title=title)
+    except Exception:
+        # Bad column types, missing data, etc. — silently skip the chart;
+        # the prose summary is still the primary answer.
+        return None
+    return None
 
 
 def _extract_text(chunk_content) -> str:
@@ -124,6 +165,8 @@ async def on_message(message: cl.Message):
     open_steps: dict[str, cl.Step] = {}
     final_answer = cl.Message(content="")
     summary_from_state: str | None = None
+    rows_for_chart: list[dict] = []
+    chart_spec: ChartSpec | None = None
 
     try:
         async for ev in app_graph.astream_events(
@@ -167,10 +210,16 @@ async def on_message(message: cl.Message):
                     if step is not None:
                         step.output = _step_body(name, output)
                         await step.update()
-                    if name == "front_agent" and output.get("intent") == "respond":
+                    if name == "front_agent" and output.get("intent") in ("respond", "rechart"):
                         summary_from_state = output.get("summary")
+                    if name == "execute_sql" and output.get("rows"):
+                        rows_for_chart = output["rows"]
+                    if name == "generate_chart" and output.get("chart"):
+                        chart_spec = output["chart"]
 
-            # Capture summarize's final state in case streaming missed any tokens
+            # Capture summarize's final state in case streaming missed any tokens.
+            # summarize is NOT in NODE_LABEL (its prose streams to the message
+            # instead of into a Step), so this elif still gets reached.
             elif name == "summarize" and kind == "on_chain_end":
                 output = ev["data"].get("output") or {}
                 if output.get("summary"):
@@ -187,5 +236,18 @@ async def on_message(message: cl.Message):
         final_answer.content = summary_from_state
     if not final_answer.content:
         final_answer.content = "_(no response produced)_"
+
+    # Attach a chart to the final answer when one was suggested.
+    # On the rechart path, execute_sql didn't fire this turn, so rows_for_chart
+    # is empty — pull the persisted rows from the checkpointed state.
+    if chart_spec is not None:
+        if not rows_for_chart:
+            snapshot = await app_graph.aget_state(config)
+            rows_for_chart = snapshot.values.get("rows") or []
+        fig = _build_chart(chart_spec, rows_for_chart)
+        if fig is not None:
+            final_answer.elements = [
+                cl.Plotly(name="chart", figure=fig, display="inline")
+            ]
 
     await final_answer.send()

@@ -4,21 +4,35 @@ from pydantic import BaseModel, Field, model_validator
 
 
 class FrontAgentDecision(BaseModel):
-    intent: Literal["data", "respond"] = Field(
+    intent: Literal["data", "respond", "rechart"] = Field(
         description=(
             "'data' if the user is asking a clear, answerable data question; "
-            "'respond' for chat, clarification, or out-of-scope replies."
+            "'rechart' if the user wants to re-render the previous query's data "
+            "as a different chart kind (no new SQL); "
+            "'respond' for chat, clarification, refusals, or out-of-scope replies."
         )
     )
     response_text: str | None = Field(
         default=None,
-        description="When intent='respond', the message to send to the user. Null when intent='data'.",
+        description=(
+            "Required for 'respond' and 'rechart'. The message sent to the user. "
+            "For 'rechart', a brief acknowledgment like 'Here it is as a pie chart.' "
+            "Null for 'data'."
+        ),
     )
     data_question: str | None = Field(
         default=None,
         description=(
             "When intent='data', a self-contained restatement of what to query — "
-            "pronouns resolved, time scope explicit. Null when intent='respond'."
+            "pronouns resolved, time scope explicit. Null otherwise."
+        ),
+    )
+    chart_kind_override: Literal["bar", "line", "pie", "table"] | None = Field(
+        default=None,
+        description=(
+            "When intent='rechart', the chart kind the user asked for. "
+            "Use 'table' if the user wants the rendering as a table (no chart). "
+            "Null otherwise."
         ),
     )
 
@@ -28,6 +42,8 @@ class FrontAgentDecision(BaseModel):
             raise ValueError("intent='data' requires a non-empty data_question")
         if self.intent == "respond" and not self.response_text:
             raise ValueError("intent='respond' requires a non-empty response_text")
+        if self.intent == "rechart" and not self.response_text:
+            raise ValueError("intent='rechart' requires a non-empty response_text")
         return self
 
 

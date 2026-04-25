@@ -5,13 +5,18 @@ from langgraph.checkpoint.memory import MemorySaver
 from agent.state import AgentState
 from agent.nodes import (
     front_agent, generate_sql, validate_sql,
-    execute_sql, summarize,
+    execute_sql, summarize, generate_chart,
     MAX_RETRIES,
 )
 
 
 def after_front(state: AgentState) -> str:
-    return "generate_sql" if state["intent"] == "data" else "END"
+    intent = state["intent"]
+    if intent == "data":
+        return "generate_sql"
+    if intent == "rechart":
+        return "generate_chart"
+    return "END"  # respond
 
 
 def after_validate(state: AgentState) -> str:
@@ -37,11 +42,13 @@ def build_graph():
     g.add_node("validate_sql", validate_sql)
     g.add_node("execute_sql", execute_sql)
     g.add_node("summarize", summarize)
+    g.add_node("generate_chart", generate_chart)
 
     g.set_entry_point("front_agent")
     g.add_conditional_edges("front_agent", after_front, {
-        "generate_sql": "generate_sql",
-        "END": END,
+        "generate_sql":   "generate_sql",
+        "generate_chart": "generate_chart",
+        "END":            END,
     })
     g.add_edge("generate_sql", "validate_sql")
     g.add_conditional_edges("validate_sql", after_validate, {
@@ -53,7 +60,8 @@ def build_graph():
         "generate_sql": "generate_sql",
         "summarize": "summarize",
     })
-    g.add_edge("summarize", END)
+    g.add_edge("summarize", "generate_chart")
+    g.add_edge("generate_chart", END)
 
     return g.compile(checkpointer=MemorySaver())
 

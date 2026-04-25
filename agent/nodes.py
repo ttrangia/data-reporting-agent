@@ -6,7 +6,11 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from sqlalchemy.exc import DBAPIError, OperationalError
 
 from agent.db import pagila_schema_string, run_query
+from agent.chart_directive import detect as detect_chart_directive
 from agent.prompts import (
+    CHART_FORCE_NOTE,
+    CHART_SPEC_SYSTEM,
+    CHART_SPEC_USER,
     DATASET_NOTES,
     FRONT_AGENT_SYSTEM,
     FRONT_AGENT_USER,
@@ -16,13 +20,15 @@ from agent.prompts import (
     SUMMARIZE_SYSTEM,
     SUMMARIZE_USER,
 )
+from agent.safety import check_input
 from agent.schemas import FrontAgentDecision, SQLGeneration
 from agent.sql_guard import guard
-from agent.state import AgentState
+from agent.state import AgentState, ChartSpec
 
 MAX_RETRIES = 2
 SUMMARIZE_ROW_BUDGET = 50
-HISTORY_TURN_LIMIT = 12  # last N messages shown to front agent
+HISTORY_TURN_LIMIT = 12   # last N messages shown to front agent
+CHART_ROW_BUDGET = 20     # rows shown to chart picker — enough to see shape, cheap to send
 
 
 @cache
@@ -41,6 +47,12 @@ def _sql_generator():
 def _summarizer():
     # Plain LLM (no structured output) so token streaming has clean text chunks
     return ChatAnthropic(model="claude-sonnet-4-5", temperature=0)
+
+
+@cache
+def _chart_picker():
+    llm = ChatAnthropic(model="claude-sonnet-4-5", temperature=0)
+    return llm.with_structured_output(ChartSpec)
 
 
 def _format_history(messages: list[BaseMessage], current_question: str) -> str:
@@ -72,7 +84,21 @@ def _rows_block(rows: list[dict] | None, sql_error: str | None) -> str:
 
 
 def front_agent(state: AgentState) -> dict:
-    """Conversational front-end. Either replies directly or hands a clean question to SQL gen."""
+    """Conversational front-end. Either replies directly or hands a clean question to SQL gen.
+
+    Deterministic safety gate runs first — obvious prompt-injection / bulk-PII /
+    over-length inputs short-circuit to a refusal without spending an LLM call.
+    The LLM-layer policy in FRONT_AGENT_SYSTEM handles nuanced cases that slip
+    past the regex gate.
+    """
+    refusal = check_input(state["question"])
+    if refusal is not None:
+        return {
+            "intent": "respond",
+            "summary": refusal,
+            "messages": [AIMessage(content=refusal)],
+        }
+
     system = FRONT_AGENT_SYSTEM.format(dataset_notes=DATASET_NOTES)
     user = FRONT_AGENT_USER.format(
         conversation=_format_history(state.get("messages") or [], state["question"]),
@@ -84,6 +110,14 @@ def front_agent(state: AgentState) -> dict:
 
     if decision.intent == "data":
         return {"intent": "data", "data_question": decision.data_question}
+
+    if decision.intent == "rechart":
+        return {
+            "intent": "rechart",
+            "summary": decision.response_text,
+            "chart_kind_override": decision.chart_kind_override,
+            "messages": [AIMessage(content=decision.response_text)],
+        }
 
     return {
         "intent": "respond",
@@ -164,6 +198,116 @@ def execute_sql(state: AgentState) -> dict:
             "sql_error": f"Unexpected error: {type(e).__name__}: {e}",
             "retries": state["retries"] + 1,
         }
+
+
+def _force_default_spec(rows: list[dict], question: str) -> ChartSpec:
+    """Pick a sensible default chart when the user explicitly asked for one
+    but the LLM declined. Heuristic: take the rightmost numeric column as y
+    (typically the aggregate) and the first non-numeric or first column as x."""
+    columns = list(rows[0].keys())
+    numeric_cols = [
+        c for c in columns
+        if all(isinstance(r.get(c), (int, float)) and not isinstance(r.get(c), bool)
+               for r in rows[:5] if r.get(c) is not None)
+    ]
+    y = numeric_cols[-1] if numeric_cols else columns[-1]
+    x_candidates = [c for c in columns if c != y]
+    x = x_candidates[0] if x_candidates else columns[0]
+    return ChartSpec(
+        kind="bar", x=x, y=y,
+        title=question.strip().rstrip("?.!")[:80],
+        reasoning="User explicitly requested a chart; picked bar as a sensible default.",
+    )
+
+
+def generate_chart(state: AgentState) -> dict:
+    """Pick a visualization for the result rows. Runs after summarize on the data path.
+
+    Three modes driven by the user's raw question:
+      - "skip"  — user explicitly said no chart → return None, no LLM call
+      - "force" — user explicitly asked for a chart → LLM must pick one;
+                  if it picks "none" anyway, fall back to a deterministic default
+      - "auto"  — silent on charts → current heuristic (LLM picks; pre-filter
+                  out trivial cases like single rows)
+    """
+    rows = state.get("rows") or []
+
+    if state.get("sql_error") or not rows:
+        return {"chart": None}
+
+    # Explicit kind override (set by front_agent on the rechart path) wins —
+    # deterministic, no LLM call. "table" means the user wants no chart.
+    override = state.get("chart_kind_override")
+    if override:
+        if override == "table":
+            return {"chart": None}
+        # On rechart, the prior chart's x/y/title are the right source —
+        # the title was crafted as a descriptive caption for THIS data on
+        # the original turn. The current turn's `question` is literally
+        # the rechart command ("replot as pie") — useless as a caption.
+        prior = state.get("chart")
+        if prior and prior.x and prior.y:
+            spec = ChartSpec(
+                kind=override,
+                x=prior.x,
+                y=prior.y,
+                title=prior.title or _force_default_spec(
+                    rows, state.get("data_question") or state["question"]
+                ).title,
+                reasoning=f"User requested a {override} chart; reusing prior axes/title.",
+            )
+        else:
+            # No prior chart (first-turn force, or prior was unchartable).
+            # Use the original meaningful question, never the rechart command.
+            spec = _force_default_spec(
+                rows, state.get("data_question") or state["question"]
+            )
+            spec.kind = override
+            spec.reasoning = f"User explicitly requested a {override} chart."
+        return {"chart": spec}
+
+    raw_question = state.get("question") or ""
+    directive = detect_chart_directive(raw_question)
+
+    if directive == "skip":
+        return {"chart": None}
+
+    # Auto-mode skips trivially small results. Force-mode does not — if the
+    # user asked for a chart of one row, we'll still try.
+    if directive == "auto" and len(rows) == 1:
+        return {"chart": None}
+
+    columns = list(rows[0].keys())
+    sample = rows[:CHART_ROW_BUDGET]
+    user = CHART_SPEC_USER.format(
+        directive_note=CHART_FORCE_NOTE if directive == "force" else "",
+        question=state.get("data_question") or state["question"],
+        columns=", ".join(columns),
+        n_total=len(rows),
+        n_shown=len(sample),
+        rows_json=json.dumps(sample, default=str, indent=2),
+    )
+    spec: ChartSpec = _chart_picker().invoke(
+        [{"role": "system", "content": CHART_SPEC_SYSTEM}, {"role": "user", "content": user}]
+    )
+
+    # Validate the LLM's column choices against the actual result columns —
+    # the prompt forbids invented names, but verify deterministically.
+    if spec.kind in ("bar", "line", "pie"):
+        if spec.x not in columns or spec.y not in columns:
+            if directive == "force":
+                spec = _force_default_spec(rows, state.get("data_question") or state["question"])
+            else:
+                return {"chart": None}
+
+    # Force override: if the LLM still picked "none"/"table" despite the
+    # explicit instruction, coerce to a default chart.
+    if spec.kind in ("none", "table") and directive == "force":
+        spec = _force_default_spec(rows, state.get("data_question") or state["question"])
+
+    if spec.kind == "none":
+        return {"chart": None}
+    return {"chart": spec}
 
 
 async def summarize(state: AgentState) -> dict:
