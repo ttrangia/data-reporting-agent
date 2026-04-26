@@ -59,6 +59,7 @@ NODE_LABEL = {
     "diagnose_empty":   "Investigating empty result",
     "generate_chart":   "Designing chart",
     "plan_report":      "Planning report sections",
+    "warmup_sql_cache": "Warming SQL prompt cache",
     "sub_query":        "Section query",
     # aggregate_report is excluded — its prose IS the streaming message.
 }
@@ -71,6 +72,7 @@ NODE_ICON = {
     "diagnose_empty":   "search-check",
     "generate_chart":   "chart-bar",
     "plan_report":      "list-checks",
+    "warmup_sql_cache": "flame",
     "sub_query":        "file-search",
 }
 
@@ -112,6 +114,12 @@ def _step_body(node: str, output: dict) -> str:
         return _chart_step_body(output.get("chart"))
     if node == "plan_report":
         return _plan_report_step_body(output)
+    if node == "warmup_sql_cache":
+        return (
+            "_Pre-warming Anthropic prompt cache so the parallel section "
+            "queries below all hit the cache instead of each paying the "
+            "write premium on the ~9K-token SQL system prompt._"
+        )
     if node == "sub_query":
         return _sub_query_step_body(output)
     # Fallback for any node added to NODE_LABEL without a custom branch above.
@@ -273,7 +281,15 @@ async def on_chat_start():
 @cl.on_message
 async def on_message(message: cl.Message):
     thread_id = cl.user_session.get("thread_id")
-    config = {"configurable": {"thread_id": thread_id}}
+    # LangSmith picks up `tags` and `metadata` automatically when
+    # LANGSMITH_TRACING=true. Tagging by source lets you filter the dashboard
+    # for "user chats" vs "eval runs" without trawling a single firehose.
+    config = {
+        "configurable": {"thread_id": thread_id},
+        "tags": ["chainlit"],
+        "metadata": {"source": "chainlit", "thread_id": thread_id},
+        "run_name": f"chat:{(message.content or '')[:60]}",
+    }
 
     open_steps: dict[str, cl.Step] = {}
     final_answer = cl.Message(content="")

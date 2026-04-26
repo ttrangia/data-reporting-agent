@@ -6,7 +6,12 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from sqlalchemy.exc import DBAPIError, OperationalError
 
-from agent.db import pagila_schema_string, run_query, vocabulary_string
+from agent.db import (
+    pagila_schema_string,
+    pagila_table_index_string,
+    run_query,
+    vocabulary_string,
+)
 from agent.chart_directive import detect as detect_chart_directive
 from agent.prompts import (
     CHART_CODE_SYSTEM,
@@ -42,6 +47,65 @@ SUMMARIZE_ROW_BUDGET = 50
 HISTORY_TURN_LIMIT = 12   # last N messages shown to front agent
 CHART_ROW_BUDGET = 20     # rows shown to chart picker — enough to see shape, cheap to send
 
+# LLM transport hardening. Three layers, defense-in-depth:
+#   1. SDK request timeout (LLM_REQUEST_TIMEOUT_S): per-attempt cap on the
+#      HTTP roundtrip. Anthropic's default is 600s — way too long; a slow
+#      response shouldn't make a user wait 10 minutes for an error.
+#   2. SDK max_retries: auto-retries 429s, 5xx, and connection errors with
+#      backoff. Two retries → 3 attempts max → ≤90s worst-case per call.
+#   3. Hard async ceiling (LLM_HARD_TIMEOUT_S): asyncio.wait_for around the
+#      whole call. Belt-and-suspenders for socket/DNS stalls that bypass
+#      the SDK's HTTP timer (rare, but observed in production). Without
+#      this, a user-visible "thinking…" can hang forever.
+LLM_REQUEST_TIMEOUT_S = 30.0
+LLM_MAX_RETRIES = 2
+LLM_HARD_TIMEOUT_S = 90.0   # > LLM_REQUEST_TIMEOUT_S * (LLM_MAX_RETRIES + 1)
+
+
+def _make_llm(model: str) -> ChatAnthropic:
+    """Single source of truth for transport config across all nodes."""
+    return ChatAnthropic(
+        model=model,
+        temperature=0,
+        timeout=LLM_REQUEST_TIMEOUT_S,
+        max_retries=LLM_MAX_RETRIES,
+    )
+
+
+class LLMTransportError(Exception):
+    """Raised when an LLM call exceeds the hard async ceiling or transport
+    fails after SDK retries. Caught at the node level and converted into a
+    graceful state update so the graph never freezes the UI."""
+
+
+async def _safe_ainvoke(runnable, messages, *, op: str, hard_timeout: float = LLM_HARD_TIMEOUT_S):
+    """Async LLM call with a hard wall-clock ceiling.
+    Raises LLMTransportError on timeout or exhausted retries — caller
+    decides how to degrade (cached prior output, terse fallback string)."""
+    try:
+        return await asyncio.wait_for(runnable.ainvoke(messages), timeout=hard_timeout)
+    except asyncio.TimeoutError as e:
+        raise LLMTransportError(f"{op} timed out after {hard_timeout:.0f}s") from e
+    except Exception as e:
+        raise LLMTransportError(f"{op} failed: {type(e).__name__}: {e}") from e
+
+
+async def _safe_invoke_in_thread(runnable, messages, *, op: str, hard_timeout: float = LLM_HARD_TIMEOUT_S):
+    """Sync `.invoke()` offloaded to a worker thread, with a hard ceiling.
+    Used by `sub_query` so a stalled SDK call in one parallel branch can't
+    block its siblings indefinitely. The thread itself isn't killable
+    (Python limitation) but the await releases — the orphan thread will
+    eventually exit when the SDK does."""
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(runnable.invoke, messages),
+            timeout=hard_timeout,
+        )
+    except asyncio.TimeoutError as e:
+        raise LLMTransportError(f"{op} timed out after {hard_timeout:.0f}s") from e
+    except Exception as e:
+        raise LLMTransportError(f"{op} failed: {type(e).__name__}: {e}") from e
+
 
 def _cached_system(text: str) -> dict:
     """System message with Anthropic prompt caching enabled.
@@ -67,20 +131,18 @@ def _cached_system(text: str) -> dict:
 
 @cache
 def _front_agent_llm():
-    llm = ChatAnthropic(model="claude-sonnet-4-6", temperature=0)
-    return llm.with_structured_output(FrontAgentDecision)
+    return _make_llm("claude-sonnet-4-6").with_structured_output(FrontAgentDecision)
 
 
 @cache
 def _sql_generator():
-    llm = ChatAnthropic(model="claude-sonnet-4-6", temperature=0)
-    return llm.with_structured_output(SQLGeneration)
+    return _make_llm("claude-sonnet-4-6").with_structured_output(SQLGeneration)
 
 
 @cache
 def _summarizer():
     # Plain LLM (no structured output) so token streaming has clean text chunks
-    return ChatAnthropic(model="claude-haiku-4-5-20251001", temperature=0)
+    return _make_llm("claude-haiku-4-5-20251001")
 
 
 @cache
@@ -88,32 +150,30 @@ def _response_llm():
     # Plain LLM for the streaming respond/rechart reply. Haiku — short outputs,
     # latency matters here since this is the user's first visible token after
     # routing.
-    return ChatAnthropic(model="claude-haiku-4-5-20251001", temperature=0)
+    return _make_llm("claude-haiku-4-5-20251001")
 
 
 @cache
 def _chart_picker():
-    llm = ChatAnthropic(model="claude-sonnet-4-6", temperature=0)
-    return llm.with_structured_output(ChartCode)
+    return _make_llm("claude-sonnet-4-6").with_structured_output(ChartCode)
 
 
 @cache
 def _report_planner():
-    llm = ChatAnthropic(model="claude-sonnet-4-6", temperature=0)
-    return llm.with_structured_output(ReportPlan)
+    return _make_llm("claude-sonnet-4-6").with_structured_output(ReportPlan)
 
 
 @cache
 def _section_summarizer():
     # Plain Haiku — short per-section blurbs, fast.
-    return ChatAnthropic(model="claude-haiku-4-5-20251001", temperature=0)
+    return _make_llm("claude-haiku-4-5-20251001")
 
 
 @cache
 def _report_aggregator():
     # Plain Sonnet — composing the report is the user-visible final pass.
     # Sonnet's prose quality matters more than latency here.
-    return ChatAnthropic(model="claude-sonnet-4-6", temperature=0)
+    return _make_llm("claude-sonnet-4-6")
 
 
 def _format_history(messages: list[BaseMessage], current_question: str) -> str:
@@ -215,14 +275,22 @@ async def generate_response(state: AgentState) -> dict:
         intent=intent,
         intent_context=intent_context,
     )
-    msg = await _response_llm().ainvoke(
-        [{"role": "system", "content": GENERATE_RESPONSE_SYSTEM},
-         {"role": "user", "content": user_msg}]
-    )
-    text = msg.content if isinstance(msg.content, str) else "".join(
-        b.get("text", "") for b in msg.content
-        if isinstance(b, dict) and b.get("type") in ("text", "text_delta")
-    )
+    try:
+        msg = await _safe_ainvoke(
+            _response_llm(),
+            [{"role": "system", "content": GENERATE_RESPONSE_SYSTEM},
+             {"role": "user", "content": user_msg}],
+            op="generate_response",
+        )
+        text = msg.content if isinstance(msg.content, str) else "".join(
+            b.get("text", "") for b in msg.content
+            if isinstance(b, dict) and b.get("type") in ("text", "text_delta")
+        )
+    except LLMTransportError as e:
+        text = (
+            "Sorry — I couldn't reach the language model just now "
+            f"({e}). Please try again in a moment."
+        )
     return {
         "summary": text,
         "messages": [AIMessage(content=text)],
@@ -475,13 +543,24 @@ async def summarize(state: AgentState) -> dict:
             state.get("diagnostic_sql"), state.get("diagnostic_rows")
         ),
     )
-    msg = await _summarizer().ainvoke(
-        [{"role": "system", "content": system}, {"role": "user", "content": user}]
-    )
-    summary_text = msg.content if isinstance(msg.content, str) else "".join(
-        b.get("text", "") for b in msg.content
-        if isinstance(b, dict) and b.get("type") in ("text", "text_delta")
-    )
+    try:
+        msg = await _safe_ainvoke(
+            _summarizer(),
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            op="summarize",
+        )
+        summary_text = msg.content if isinstance(msg.content, str) else "".join(
+            b.get("text", "") for b in msg.content
+            if isinstance(b, dict) and b.get("type") in ("text", "text_delta")
+        )
+    except LLMTransportError as e:
+        # Surface a useful failure rather than freezing the user's chat.
+        # Include the SQL row count so they at least know the query worked.
+        rows = state.get("rows") or []
+        summary_text = (
+            f"Got {len(rows)} row(s) back, but the summarizer is unreachable "
+            f"({e}). The query and results are visible in the steps above."
+        )
     return {
         "summary": summary_text,
         "messages": [AIMessage(content=summary_text)],
@@ -495,6 +574,43 @@ REPORT_SECTION_ROW_BUDGET = 30   # rows shown to the section summarizer LLM
 REPORT_SECTION_CHART_ROW_BUDGET = 500  # rows persisted on the section for chart rendering
 
 
+async def warmup_sql_cache(state: AgentState) -> dict:
+    """Pre-warm the SQL-generator's prompt cache before parallel fan-out.
+
+    Anthropic's prompt cache is shared across requests, but only after a
+    write completes. When N parallel sub_queries fire at once, none of them
+    see the cache yet — they all pay the 1.25× write premium on the same
+    ~8.9K-token SQL-gen prefix (schema + dataset notes + vocabulary). One
+    serialized call writes the cache; the subsequent fan-out hits it.
+
+    Trade-off: +1 LLM call (~$0.02, ~2-3s) before the report fans out.
+    Saves on a 5-section report: ~30K input tokens billed at write rate
+    (≈ 4 × 8.9K × 1.15 redundant write premium).
+
+    Failures are silent — a warmup miss only forfeits the optimization;
+    each sub_query will write its own cache as before.
+    """
+    sys_prompt = SQL_GENERATION_SYSTEM.format(
+        dataset_notes=DATASET_NOTES,
+        vocabulary=vocabulary_string(),
+        schema=pagila_schema_string(),
+    )
+    usr_prompt = SQL_GENERATION_USER.format(
+        retry_context="",
+        question="(cache warmup — produce any short valid SELECT)",
+    )
+    try:
+        await _safe_invoke_in_thread(
+            _sql_generator(),
+            [_cached_system(sys_prompt), {"role": "user", "content": usr_prompt}],
+            op="warmup_sql_cache",
+            hard_timeout=20.0,  # tight ceiling — if warmup is slow, give up
+        )
+    except Exception:
+        pass  # cache miss on fan-out is the worst case; never block the report
+    return {}
+
+
 def plan_report(state: AgentState) -> dict:
     """Decompose the user's broad question into 3-7 sub-questions.
 
@@ -505,13 +621,20 @@ def plan_report(state: AgentState) -> dict:
         question=state.get("data_question") or state["question"],
         conversation=_format_history(state.get("messages") or [], state["question"]),
     )
+    # Planner gets the compact table index (~1K tokens), NOT the full DDL +
+    # sample rows used by the SQL generator. The planner only emits natural-
+    # language sub-questions; it doesn't need column types or vocabulary.
+    # That drops the planner's prompt from ~9.9K to ~2K tokens — small enough
+    # that prompt caching isn't worth it. Reports rarely happen back-to-back
+    # within Anthropic's 5-min cache TTL, so the cache-write premium (1.25×)
+    # would dominate vs paying 1× per call.
     system = REPORT_PLANNER_SYSTEM.format(
         dataset_notes=DATASET_NOTES,
-        vocabulary=vocabulary_string(),
-        schema=pagila_schema_string(),
+        table_index=pagila_table_index_string(),
     )
     plan: ReportPlan = _report_planner().invoke(
-        [_cached_system(system), {"role": "user", "content": user}]
+        [{"role": "system", "content": system},
+         {"role": "user", "content": user}]
     )
     return {
         "report_outline": plan.sections,
@@ -564,7 +687,8 @@ async def sub_query(state: AgentState) -> dict:
     def _failed(msg: str) -> dict:
         return {"report_sections": [section.model_copy(update={"error": msg})]}
 
-    # 1. Generate SQL
+    # 1. Generate SQL — uses _safe_invoke_in_thread so a stalled SDK call
+    # in this branch can't block sibling sections indefinitely.
     try:
         sys_prompt = SQL_GENERATION_SYSTEM.format(
             dataset_notes=DATASET_NOTES,
@@ -572,11 +696,14 @@ async def sub_query(state: AgentState) -> dict:
             schema=pagila_schema_string(),
         )
         usr_prompt = SQL_GENERATION_USER.format(retry_context="", question=section.sub_question)
-        sql_result: SQLGeneration = await asyncio.to_thread(
-            _sql_generator().invoke,
+        sql_result: SQLGeneration = await _safe_invoke_in_thread(
+            _sql_generator(),
             [_cached_system(sys_prompt), {"role": "user", "content": usr_prompt}],
+            op=f"sub_query.sql_gen[{section.title}]",
         )
         raw_sql = sql_result.sql
+    except LLMTransportError as e:
+        return _failed(f"SQL generation transport error: {e}")
     except Exception as e:
         return _failed(f"SQL generation failed: {type(e).__name__}: {e}")
 
@@ -603,9 +730,11 @@ async def sub_query(state: AgentState) -> dict:
         rows_preview=json.dumps(preview, default=str, indent=2),
     )
     try:
-        summary_msg = await _section_summarizer().ainvoke(
+        summary_msg = await _safe_ainvoke(
+            _section_summarizer(),
             [{"role": "system", "content": SECTION_SUMMARIZER_SYSTEM},
-             {"role": "user", "content": summarizer_user}]
+             {"role": "user", "content": summarizer_user}],
+            op=f"sub_query.summarize[{section.title}]",
         )
         section_summary = (
             summary_msg.content if isinstance(summary_msg.content, str)
@@ -614,13 +743,19 @@ async def sub_query(state: AgentState) -> dict:
                 if isinstance(b, dict) and b.get("type") in ("text", "text_delta")
             )
         )
+    except LLMTransportError as e:
+        section_summary = f"(summary unavailable: {e})"
     except Exception as e:
         section_summary = f"(summary unavailable: {type(e).__name__})"
 
-    # 5. Chart code (LLM call — also offloaded so it doesn't block siblings)
+    # 5. Chart code (LLM call — also offloaded with the hard ceiling so it
+    # can't hold up the parallel branch indefinitely on a stalled SDK call).
     try:
-        chart = await asyncio.to_thread(_section_chart, section, rows)
-    except Exception:
+        chart = await asyncio.wait_for(
+            asyncio.to_thread(_section_chart, section, rows),
+            timeout=LLM_HARD_TIMEOUT_S,
+        )
+    except (asyncio.TimeoutError, Exception):
         chart = None
 
     completed = section.model_copy(update={
@@ -672,14 +807,29 @@ async def aggregate_report(state: AgentState) -> dict:
         sections_block="\n\n".join(section_blocks) or "(no sections completed)",
         failed_sections="\n".join(failed_lines) or "(none)",
     )
-    msg = await _report_aggregator().ainvoke(
-        [{"role": "system", "content": REPORT_AGGREGATOR_SYSTEM},
-         {"role": "user", "content": user}]
-    )
-    text = msg.content if isinstance(msg.content, str) else "".join(
-        b.get("text", "") for b in msg.content
-        if isinstance(b, dict) and b.get("type") in ("text", "text_delta")
-    )
+    try:
+        msg = await _safe_ainvoke(
+            _report_aggregator(),
+            [{"role": "system", "content": REPORT_AGGREGATOR_SYSTEM},
+             {"role": "user", "content": user}],
+            op="aggregate_report",
+            # Slightly longer ceiling — aggregation is the longest single
+            # generation in the graph (multi-section narrative).
+            hard_timeout=LLM_HARD_TIMEOUT_S * 1.5,
+        )
+        text = msg.content if isinstance(msg.content, str) else "".join(
+            b.get("text", "") for b in msg.content
+            if isinstance(b, dict) and b.get("type") in ("text", "text_delta")
+        )
+    except LLMTransportError as e:
+        # Sections are intact in state — surface a fallback that lists
+        # what we have so the user gets value even when aggregation fails.
+        completed_titles = [s.title for s in sorted_sections if not s.error]
+        text = (
+            f"The report aggregator is unreachable ({e}). "
+            f"{len(completed_titles)} of {len(sorted_sections)} sections "
+            "completed; their queries and blurbs are visible in the steps above."
+        )
     return {
         "summary": text,
         "report_text": text,

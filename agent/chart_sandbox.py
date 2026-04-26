@@ -30,6 +30,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 
 SANDBOX_TIMEOUT_SECONDS = 5.0
@@ -80,16 +81,70 @@ class SandboxError(Exception):
     """Raised on any sandbox failure — AST violation, runtime error, timeout."""
 
 
-def validate_ast(code: str) -> None:
-    """Reject code that could escape the sandbox via static patterns."""
+# Imports the LLM keeps writing despite the prompt forbidding them. These
+# bind the same modules already injected into the sandbox globals (df/pd/px/
+# go/np), so silently stripping them is safe — equivalent to a no-op. Any
+# import not on this allowlist still raises SandboxError.
+_REIMPORT_ALLOWED: dict[tuple[str, str | None], set[str]] = {
+    # (module, alias_or_None) → set of acceptable target names
+    ("pandas", "pd"): {"pd"},
+    ("numpy", "np"): {"np"},
+    ("plotly.express", "px"): {"px"},
+    ("plotly.graph_objects", "go"): {"go"},
+    ("plotly.graph_objs", "go"): {"go"},
+}
+
+# `from plotly.subplots import make_subplots` — the LLM's preferred form for
+# subplot construction. make_subplots is already injected into the sandbox
+# globals, so this re-import is a functional no-op we can safely strip.
+_REIMPORT_FROM_ALLOWED: dict[str, set[str]] = {
+    "plotly.subplots": {"make_subplots"},
+    "plotly.graph_objects": {"Figure", "Bar", "Scatter", "Pie"},
+}
+
+
+def _is_allowed_import(node: ast.AST) -> bool:
+    """True if this node is a redundant re-import of a sandbox-injected
+    library. The LLM frequently writes these despite the prompt — strip
+    rather than crash, since they're functionally no-ops."""
+    if isinstance(node, ast.Import):
+        return all(
+            (alias.name, alias.asname) in _REIMPORT_ALLOWED
+            for alias in node.names
+        )
+    if isinstance(node, ast.ImportFrom):
+        if node.module in _REIMPORT_FROM_ALLOWED:
+            allowed_names = _REIMPORT_FROM_ALLOWED[node.module]
+            return all(alias.name in allowed_names for alias in node.names)
+        # `from plotly import express as px` style
+        if node.module in {"plotly", "pandas", "numpy"}:
+            return all(
+                alias.asname in {"px", "go", "pd", "np"}
+                or alias.name in {"express", "graph_objects", "graph_objs"}
+                for alias in node.names
+            )
+    return False
+
+
+def validate_ast(code: str) -> ast.Module:
+    """Reject code that could escape the sandbox via static patterns.
+    Returns the parsed tree (with redundant imports stripped) so callers
+    can compile from the cleaned AST."""
     try:
         tree = ast.parse(code, mode="exec")
     except SyntaxError as e:
         raise SandboxError(f"Syntax error: {e.msg} (line {e.lineno})")
 
+    # Filter out allowed re-imports at the top level before validation, so
+    # the rest of the walker doesn't trip on them.
+    tree.body = [
+        n for n in tree.body
+        if not (isinstance(n, (ast.Import, ast.ImportFrom)) and _is_allowed_import(n))
+    ]
+
     for node in ast.walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
-            raise SandboxError("Import statements are not allowed")
+            raise SandboxError(f"Import statements are not allowed: {ast.unparse(node)}")
         if isinstance(node, ast.Name) and node.id in DISALLOWED_NAMES:
             raise SandboxError(f"Disallowed name: '{node.id}'")
         if isinstance(node, ast.Attribute):
@@ -97,6 +152,7 @@ def validate_ast(code: str) -> None:
             # (e.g., obj.__class__.__bases__[0].__subclasses__()).
             if node.attr.startswith("__") and node.attr.endswith("__"):
                 raise SandboxError(f"Dunder attribute access not allowed: '{node.attr}'")
+    return tree
 
 
 # Single shared executor — chart execs are bounded by SANDBOX_TIMEOUT_SECONDS,
@@ -111,7 +167,11 @@ def execute_chart_code(code: str, rows: list[dict]) -> go.Figure | None:
     `_build_chart`) is expected to catch and degrade gracefully to "no chart"
     rather than killing the whole turn.
     """
-    validate_ast(code)
+    # Validate AND strip allowed re-imports — exec the cleaned tree, not
+    # the original source, so any `import plotly.graph_objects as go` the
+    # LLM wrote disappears without the sandbox treating it as an escape.
+    cleaned = validate_ast(code)
+    compiled = compile(cleaned, "<chart_sandbox>", "exec")
 
     if not rows:
         return None
@@ -124,11 +184,12 @@ def execute_chart_code(code: str, rows: list[dict]) -> go.Figure | None:
         "px": px,
         "go": go,
         "np": np,
+        "make_subplots": make_subplots,
     }
     sandbox_locals: dict[str, Any] = {}
 
     def _run():
-        exec(code, sandbox_globals, sandbox_locals)
+        exec(compiled, sandbox_globals, sandbox_locals)
         return sandbox_locals.get("fig", sandbox_globals.get("fig"))
 
     try:

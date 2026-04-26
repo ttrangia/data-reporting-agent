@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import subprocess
 import time
 import uuid
@@ -99,19 +100,36 @@ def _apply_predicates(expected: dict, state: dict) -> list[P.PredicateResult]:
     return out
 
 
-async def _run_case(case: dict) -> CaseResult:
+async def _run_case(case: dict, run_tag: str | None = None) -> CaseResult:
     case_id = case["id"]
     notes = case.get("notes")
     thread_id = f"eval-{case_id}-{uuid.uuid4().hex[:8]}"
-    config = {"configurable": {"thread_id": thread_id}}
 
     turn_results: list[TurnResult] = []
     pred_results: list[P.PredicateResult] = []
 
     started = time.perf_counter()
-    for turn in case["turns"]:
+    for turn_idx, turn in enumerate(case["turns"], 1):
         question = turn["question"]
         expected = turn.get("expected") or {}
+        # LangSmith tags + metadata. Tagging "eval" + the case_id lets you
+        # filter "show me failed cases this week" entirely in the LangSmith
+        # UI. run_tag is freeform — pass --tag baseline / --tag after-rag
+        # to label runs you want to compare side-by-side.
+        tags = ["eval", f"case:{case_id}"]
+        if run_tag:
+            tags.append(f"run:{run_tag}")
+        config = {
+            "configurable": {"thread_id": thread_id},
+            "tags": tags,
+            "metadata": {
+                "source": "eval",
+                "case_id": case_id,
+                "turn_index": turn_idx,
+                "run_tag": run_tag,
+            },
+            "run_name": f"eval:{case_id}" + (f":turn{turn_idx}" if len(case["turns"]) > 1 else ""),
+        }
         try:
             state = await app_graph.ainvoke(
                 turn_input(question, HumanMessage(content=question)),
@@ -163,6 +181,12 @@ async def _main() -> int:
         "--no-report", action="store_true",
         help="Skip writing the scorecard markdown file.",
     )
+    parser.add_argument(
+        "--tag", default=None,
+        help="Freeform label attached to each LangSmith trace as a tag "
+             "(e.g. 'baseline', 'after-rag'). Useful for side-by-side "
+             "comparison in the LangSmith dashboard.",
+    )
     args = parser.parse_args()
 
     cases_raw = _load_cases()
@@ -175,12 +199,22 @@ async def _main() -> int:
     if args.limit:
         cases = cases[: args.limit]
 
+    # Surface tracing status so the user knows whether traces will land in
+    # LangSmith for this run. Cheap sanity check before burning API credits.
+    tracing_on = os.getenv("LANGSMITH_TRACING", "").lower() in ("true", "1", "yes")
+    project = os.getenv("LANGSMITH_PROJECT") or "(default)"
+    if tracing_on:
+        print(f"LangSmith tracing: ON · project={project}"
+              + (f" · run_tag={args.tag}" if args.tag else ""), flush=True)
+    else:
+        print("LangSmith tracing: off (set LANGSMITH_TRACING=true to enable)", flush=True)
+
     print(f"Running {len(cases)} case(s) at concurrency={args.concurrency}…", flush=True)
     sem = asyncio.Semaphore(args.concurrency)
 
     async def _bounded(case):
         async with sem:
-            res = await _run_case(case)
+            res = await _run_case(case, run_tag=args.tag)
             mark = "✓" if res.passed else ("💥" if res.crashed else "✗")
             print(f"  {mark}  {res.case_id} ({res.elapsed_s:.1f}s)", flush=True)
             return res

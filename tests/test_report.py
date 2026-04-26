@@ -68,8 +68,7 @@ def test_plan_report_resets_accumulator_and_returns_outline():
 
     with (
         patch("agent.nodes._report_planner", return_value=planner),
-        patch("agent.nodes.pagila_schema_string", return_value="<schema>"),
-        patch("agent.nodes.vocabulary_string", return_value="<vocab>"),
+        patch("agent.nodes.pagila_table_index_string", return_value="<index>"),
     ):
         out = plan_report({
             "question": "create a quarterly report",
@@ -149,7 +148,9 @@ async def test_sub_query_degrades_gracefully_on_sql_error():
 
     s = out["report_sections"][0]
     assert s.error is not None
-    assert "SQL generation failed" in s.error
+    # Either error path (transport-error or generic-exception) is fine —
+    # both indicate SQL generation didn't produce usable SQL.
+    assert "SQL generation" in s.error
     assert s.title == "Bad"  # title preserved
 
 
@@ -197,9 +198,12 @@ async def test_report_flow_runs_parallel_sub_queries_and_aggregates():
     planner = MagicMock()
     planner.invoke.return_value = plan
 
-    # Each section produces a different SQLGeneration; all share the same SQL gen mock
+    # Each section produces a different SQLGeneration; all share the same SQL gen mock.
+    # The first invoke is the warmup_sql_cache pre-fan-out call (output discarded);
+    # the remaining 3 are the parallel sub_query branches.
     sql_gen = MagicMock()
     sql_gen.invoke.side_effect = [
+        SQLGeneration(reasoning="warmup", tables_used=["payment"], sql="SELECT 1 AS warmup"),
         SQLGeneration(reasoning="x", tables_used=["payment"], sql="SELECT SUM(amount) AS total FROM payment LIMIT 1"),
         SQLGeneration(reasoning="x", tables_used=["payment"], sql="SELECT date_trunc('month', payment_date) AS m, SUM(amount) AS r FROM payment GROUP BY m LIMIT 12"),
         SQLGeneration(reasoning="x", tables_used=["film", "rental"], sql="SELECT title, COUNT(*) AS n FROM film f JOIN rental r ON True LIMIT 10"),
@@ -237,6 +241,7 @@ async def test_report_flow_runs_parallel_sub_queries_and_aggregates():
         patch("agent.nodes._chart_picker", return_value=chart_picker),
         patch("agent.nodes._report_aggregator", return_value=aggregator),
         patch("agent.nodes.pagila_schema_string", return_value="<schema>"),
+        patch("agent.nodes.pagila_table_index_string", return_value="<index>"),
         patch("agent.nodes.vocabulary_string", return_value="<vocab>"),
         patch("agent.nodes.run_query", side_effect=fake_run_query),
     ):
@@ -253,8 +258,9 @@ async def test_report_flow_runs_parallel_sub_queries_and_aggregates():
     planner.invoke.assert_called_once()
     # 3 sections were planned
     assert len(final["report_outline"]) == 3
-    # 3 SQL gens fired (one per section, NOT one for the broad question)
-    assert sql_gen.invoke.call_count == 3
+    # 4 SQL gens fired: 1 warmup_sql_cache + 1 per section.
+    # Crucially NOT one for the broad user question itself.
+    assert sql_gen.invoke.call_count == 4
     # All 3 sections completed
     assert len(final["report_sections"]) == 3
     # Aggregator ran once and produced the final text
@@ -288,7 +294,9 @@ async def test_report_flow_continues_when_one_section_fails():
     planner.invoke.return_value = plan
 
     sql_gen = MagicMock()
+    # First call is warmup_sql_cache (output discarded), then one per section.
     sql_gen.invoke.side_effect = [
+        SQLGeneration(reasoning="warmup", tables_used=["payment"], sql="SELECT 1 AS warmup"),
         SQLGeneration(reasoning="x", tables_used=["payment"], sql="SELECT 1 AS total"),
         # Second section's SQL is mutation → guard rejects
         SQLGeneration(reasoning="x", tables_used=["customer"], sql="DELETE FROM customer"),
@@ -312,6 +320,7 @@ async def test_report_flow_continues_when_one_section_fails():
         patch("agent.nodes._chart_picker", return_value=chart_picker),
         patch("agent.nodes._report_aggregator", return_value=aggregator),
         patch("agent.nodes.pagila_schema_string", return_value="<schema>"),
+        patch("agent.nodes.pagila_table_index_string", return_value="<index>"),
         patch("agent.nodes.vocabulary_string", return_value="<vocab>"),
         patch("agent.nodes.run_query", return_value=[{"total": 100}]),
     ):

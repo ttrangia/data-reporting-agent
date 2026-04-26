@@ -20,7 +20,7 @@ from agent.nodes import (
     front_agent, generate_sql, validate_sql,
     execute_sql, diagnose_empty, summarize, generate_chart,
     generate_response,
-    plan_report, sub_query, aggregate_report,
+    plan_report, warmup_sql_cache, sub_query, aggregate_report,
     MAX_RETRIES,
 )
 
@@ -90,6 +90,7 @@ def build_graph():
     g.add_node("generate_chart", generate_chart)
     # Report-mode nodes
     g.add_node("plan_report", plan_report)
+    g.add_node("warmup_sql_cache", warmup_sql_cache)
     g.add_node("sub_query", sub_query)
     g.add_node("aggregate_report", aggregate_report)
 
@@ -100,11 +101,16 @@ def build_graph():
         "plan_report":       "plan_report",
         "END":               END,
     })
-    # Report path: plan_report → fan-out via Send → parallel sub_query →
-    # aggregate_report. LangGraph waits for all parallel branches to complete
-    # (the report_sections reducer accumulates their results) before firing
+    # Report path: plan_report → warmup_sql_cache → fan-out via Send →
+    # parallel sub_query → aggregate_report. The warmup serializes a single
+    # cache write so the parallel sub_queries that follow get cache READS
+    # instead of all paying the write premium simultaneously (no-op if the
+    # cache is already warm from a previous report within ~5 minutes).
+    # LangGraph waits for all parallel sub_query branches to complete (the
+    # report_sections reducer accumulates their results) before firing
     # aggregate_report.
-    g.add_conditional_edges("plan_report", fan_out_sections, ["sub_query"])
+    g.add_edge("plan_report", "warmup_sql_cache")
+    g.add_conditional_edges("warmup_sql_cache", fan_out_sections, ["sub_query"])
     g.add_edge("sub_query", "aggregate_report")
     g.add_edge("aggregate_report", END)
     g.add_conditional_edges("generate_response", after_generate_response, {

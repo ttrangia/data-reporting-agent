@@ -248,6 +248,10 @@ Hard rules:
 - ASSIGN your result to `fig`. If no chart is appropriate (single-value answer, all-text result, would mislead), set `fig = None`.
 - Use **current** Plotly property names — old flat names like `titlefont`, `titleside`, `titletext`, `tickfont` (top-level) were removed. Use the nested form: `title=dict(text=..., font=dict(size=14))`, `xaxis=dict(title=dict(text='...', font=dict(size=12)))`. When in doubt, prefer `fig.update_layout(title='...')` and `fig.update_xaxes(title_text='...')` — these are stable.
 - For dual-y-axis charts, set the secondary axis via `yaxis2=dict(...)` in `update_layout` and `yaxis='y2'` on the trace; do NOT use deprecated `titlefont`/`titleside` keys inside axis dicts.
+- **Comparing two metrics with different scales** (e.g. revenue + rentals per store): NEVER use grouped bars on two y-axes — `barmode='group'` does not offset bars across axes, so both bars end up drawn at the same x position and visually overlap. Pick one:
+  - **Subplots (preferred for two equally-important metrics):** `make_subplots` is already in scope. Example: `fig = make_subplots(rows=1, cols=2, subplot_titles=('Revenue', 'Rentals'))` then add one bar trace per panel. Clean, no axis-scale gymnastics.
+  - **Bar + line:** primary metric as bars on `y1`, secondary as `go.Scatter(mode='lines+markers', yaxis='y2')` on `y2`. Works well when one metric is clearly primary and the other is contextual.
+  - **Index/normalize:** rescale both metrics to a common basis (% of total, index=100, ratio) and use a single axis. Best when the comparison itself is the point.
 
 Title convention: a real chart caption (5-12 words) that names the metric and scope. Examples: "Top 5 films by rental count, 2022", "Monthly revenue trend, Feb-Aug 2022", "Revenue share by store". Avoid vague labels ("Chart", "Results", "Output"), the literal word "title", or restating the user's question verbatim.
 
@@ -404,11 +408,9 @@ Constraints:
 
 {dataset_notes}
 
-{vocabulary}
+Tables available (the SQL generator handles columns/types/joins downstream — your job is only to pick which slices of the data make a good report):
 
-Schema (DDL + 3 sample rows per table):
-
-{schema}
+{table_index}
 
 Return a structured ReportPlan."""
 

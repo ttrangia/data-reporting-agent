@@ -86,6 +86,30 @@ def pagila_schema_string() -> str:
     return _with_cold_start_retry(lambda: agent_db().get_table_info())
 
 
+@cache
+def pagila_table_index_string() -> str:
+    """Compact table-and-column listing — no DDL, no sample rows.
+
+    For nodes that DON'T write SQL but need to know what's queryable
+    (e.g. the report planner, which decomposes into natural-language
+    sub-questions). About 1K tokens vs 6.7K for the full schema.
+
+    Output shape:
+        - **table_name** (col1, col2, col3, ...)
+        - **other_table** (...)
+    """
+    def _load() -> str:
+        from sqlalchemy import inspect
+        insp = inspect(agent_engine())
+        tables = sorted(insp.get_table_names())
+        lines = []
+        for t in tables:
+            cols = [c["name"] for c in insp.get_columns(t)]
+            lines.append(f"- **{t}** ({', '.join(cols)})")
+        return "\n".join(lines)
+    return _with_cold_start_retry(_load)
+
+
 # (Table, column) pairs to pre-enumerate at boot. Picked for low cardinality
 # (< ~200 distinct values) and high "WHERE clause" usefulness — exactly the
 # values a SQL generator is most likely to misspell or hallucinate ("United
