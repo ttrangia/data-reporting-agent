@@ -29,6 +29,9 @@ chainlit.db
 # Eval reports — generated artifacts; not needed in prod
 evals/reports/
 
+# Demo videos — README assets only, no runtime use
+docs/
+
 # Tools that are dev-time only (token measurement, cache verification)
 tools/
 

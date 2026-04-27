@@ -4,6 +4,14 @@ A natural-language reporting agent over a Postgres database, built with **LangGr
 
 **Live demo:** [pagila.tinotrangia.com](https://pagila.tinotrangia.com) — DM for credentials.
 
+<video src="docs/demos/hero1.mp4" autoplay loop muted playsinline width="720"></video>
+
+*Single-question flow — pipeline steps light up live, prose streams in, chart renders alongside.*
+
+<video src="docs/demos/hero2.mp4" autoplay loop muted playsinline width="720"></video>
+
+*Multi-section report — parallel sub-queries fan out concurrently, compose into a single streamed markdown.*
+
 The substrate is a Pagila DVD-rental sample database; the interesting work is the production scaffolding around it: routing, retries, RAG, sandboxed code exec, evals, prompt-cache optimization, and graceful degradation everywhere.
 
 ---
