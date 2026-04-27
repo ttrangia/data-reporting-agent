@@ -5,11 +5,6 @@ import os
 import time
 from dotenv import load_dotenv
 load_dotenv()  # must come before any imports that read env vars
-print("[boot diagnostic] env keys present:", sorted(
-    k for k in os.environ
-    if k.startswith(("DATABASE_", "ANTHROPIC_", "VOYAGE_", "LANGSMITH_",
-                     "APP_", "CHAINLIT_", "PORT", "RAILWAY_"))
-))
 
 import chainlit as cl
 import pandas as pd
