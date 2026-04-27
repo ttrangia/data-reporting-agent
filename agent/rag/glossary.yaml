@@ -1,0 +1,148 @@
+# Business glossary — terms and conventions for the Pagila dataset.
+#
+# Each entry is one concept. The indexer embeds:
+#   term + " | " + (aliases joined) + " | " + first paragraph of definition
+# So aliases matter — list every plausible synonym a user might use.
+#
+# `conventions:` uses a literal block scalar (`|`) so its content is treated
+# as opaque text by the YAML parser — bullet points, colons, backticks,
+# quotes inside are all fine. Treat it as plain markdown that the SQL
+# generator will see at retrieval time.
+
+- id: revenue
+  term: "revenue"
+  aliases: ["sales", "gross", "income", "earnings", "money taken in"]
+  definition: |
+    Sum of `payment.amount`, in USD. The dataset has roughly $67K total
+    revenue across ~16K transactions, all dated within 2022.
+  conventions: |
+    - All amounts are USD. There is no FX or multi-currency layer.
+    - Refunds aren't tracked — treat every payment row as gross revenue.
+    - Use the canonical "inventory path" when slicing revenue by store
+      or country (see entry `store_country_path`).
+
+- id: active_customer
+  term: "active customer"
+  aliases: ["enabled customer", "current customer"]
+  definition: |
+    `customer.active = 1` (the boolean `customer.activebool` is a duplicate
+    of the same flag). This is an account-status field, not a recency one.
+  conventions: |
+    - The flag means the account hasn't been deactivated. NOT "rented recently".
+    - For "engaged" / "currently renting", users usually mean `EXISTS (SELECT 1
+      FROM rental WHERE rental.customer_id = customer.customer_id AND
+      rental.return_date IS NULL)` or a recent-rental window.
+
+- id: outstanding_rental
+  term: "outstanding rental"
+  aliases: ["open rental", "unreturned rental", "active rental",
+            "not yet returned", "still rented out"]
+  definition: |
+    A rental row where `rental.return_date IS NULL`. The film is currently
+    checked out and hasn't been returned to the store yet.
+  conventions: |
+    - For "currently rented", filter `rental.return_date IS NULL`.
+    - Don't confuse with `customer.active` — different concept.
+
+- id: rental_duration
+  term: "rental duration"
+  aliases: ["rental length", "how long rented", "days out"]
+  definition: |
+    `return_date - rental_date` (Postgres interval). Some rentals are
+    open (return_date is NULL) — those have no defined duration.
+  conventions: |
+    - For average duration over a period, filter to closed rentals
+      (`return_date IS NOT NULL`) before averaging.
+    - To express in days: `EXTRACT(EPOCH FROM (return_date - rental_date)) / 86400`.
+
+- id: time_window
+  term: "time window"
+  aliases: ["period", "date range", "when", "recent", "last month",
+            "this quarter", "year to date"]
+  definition: |
+    Rental activity is dated 2022-02-14 to 2022-08-23. Payment activity
+    is dated 2022-01-23 to 2022-07-27. Customer/film/etc. timestamps may
+    pre-date 2022; only rentals and payments are anchored.
+  conventions: |
+    - "Last month" / "recent" without a year → anchor to August 2022 (the
+      latest month with data) and state the assumption.
+    - "Q3 2022" → July-September 2022, but only July-August have data.
+    - Never assume current calendar dates apply.
+
+- id: store_country_path
+  term: "store country"
+  aliases: ["store location", "store geography", "country of store",
+            "where the store is", "by store country"]
+  definition: |
+    The `store` table has 500 entries with global addresses, but ALL
+    operational rental/payment data is concentrated at exactly 2 stores
+    via the inventory join path: store 1 (Boksburg, South Africa) and
+    store 2 (Hamilton, New Zealand). 498 of the 500 stores have zero
+    rentals and zero payments.
+  conventions: |
+    - Canonical join path: `payment → rental → inventory → store →
+      address → city → country`. Matches the `sales_by_store` view.
+    - "Revenue / sales / activity by store / country" → use this path.
+    - "Revenue in country X" where X is not South Africa or New Zealand →
+      result is empty. Be explicit: surface SA and NZ as the operational
+      countries instead of returning nothing.
+    - DO NOT use `customer.store_id` for store geography — it's a legacy
+      FK that only ever takes values 1 or 2 regardless of customer city.
+    - DO NOT use `staff → store` for "where the activity happened" —
+      staff 1 and 2 are renumbered to stores 25 (San Bernardino, US)
+      and 33 (Xiangtan, China) but actually transacted via stores 1/2.
+
+- id: customer_country
+  term: "customer country"
+  aliases: ["customer location", "where customers live", "customer geography",
+            "by customer country", "customers in country X"]
+  definition: |
+    `customer.address_id → address → city → country`. This is where the
+    customer LIVES, distinct from where their store is.
+  conventions: |
+    - For "customers in Canada", "revenue by customer country", "where
+      our customers are" → use this path.
+    - For "stores in Canada" or "store revenue by country" → use the
+      `store_country_path` entry instead.
+
+- id: top_n
+  term: "top N"
+  aliases: ["top 5", "top 10", "best", "most popular", "highest", "biggest"]
+  definition: |
+    Default ranking metric depends on the entity:
+      - Top FILMS — by rental count (COUNT(rental) descending).
+      - Top CUSTOMERS — by total spend (SUM(payment.amount) descending).
+      - Top STORES — by total revenue (SUM(payment.amount) via inventory path).
+      - Top CATEGORIES — by rental count.
+  conventions: |
+    - If the user is ambiguous, prefer rental count for film-side questions
+      and revenue for monetary questions; state the choice in your reasoning.
+    - Always use ORDER BY ... DESC LIMIT N rather than window-function
+      ranking unless ties matter.
+
+- id: film_to_rental_path
+  term: "film rentals"
+  aliases: ["how often a film was rented", "film popularity",
+            "rentals per film", "film performance"]
+  definition: |
+    Films connect to rentals through `inventory`: each film has multiple
+    inventory copies (one per store), and each copy can be rented many
+    times. Path: `film → inventory → rental`.
+  conventions: |
+    - There is NO direct film_id on rental — you must join through inventory.
+    - To count rentals per film: `GROUP BY film.title` (or film_id),
+      `COUNT(rental.rental_id)`.
+    - For "available copies", join inventory only (no rental).
+
+- id: category_to_film_path
+  term: "film category"
+  aliases: ["film genre", "movie genre", "by category", "films in genre X"]
+  definition: |
+    Many-to-many through `film_category`: `category → film_category → film`.
+    Every film has exactly one category in this dataset.
+  conventions: |
+    - For "films by category", JOIN film → film_category → category.
+    - "Action films" / "Drama films" → filter `category.name = 'Action'`
+      / `'Drama'` (capitalized in the data; lowercase fails).
+    - See vocabulary block in the SQL system prompt for canonical
+      category spellings.

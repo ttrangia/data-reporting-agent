@@ -17,7 +17,7 @@ _checkpoint_serde = JsonPlusSerializer(
     ],
 )
 from agent.nodes import (
-    front_agent, generate_sql, validate_sql,
+    front_agent, retrieve_context, generate_sql, validate_sql,
     execute_sql, diagnose_empty, summarize, generate_chart,
     generate_response,
     plan_report, warmup_sql_cache, sub_query, aggregate_report,
@@ -28,7 +28,10 @@ from agent.nodes import (
 def after_front(state: AgentState) -> str:
     intent = state["intent"]
     if intent == "data":
-        return "generate_sql"
+        # Data path goes through retrieve_context first so the SQL generator
+        # sees question-specific glossary + few-shot examples baked into
+        # its user message.
+        return "retrieve_context"
     if intent == "report":
         return "plan_report"
     # Deterministic safety refusal short-circuits with summary already set
@@ -82,6 +85,7 @@ def build_graph():
     g = StateGraph(AgentState)
     g.add_node("front_agent", front_agent)
     g.add_node("generate_response", generate_response)
+    g.add_node("retrieve_context", retrieve_context)
     g.add_node("generate_sql", generate_sql)
     g.add_node("validate_sql", validate_sql)
     g.add_node("execute_sql", execute_sql)
@@ -96,11 +100,15 @@ def build_graph():
 
     g.set_entry_point("front_agent")
     g.add_conditional_edges("front_agent", after_front, {
-        "generate_sql":      "generate_sql",
+        "retrieve_context":  "retrieve_context",
         "generate_response": "generate_response",
         "plan_report":       "plan_report",
         "END":               END,
     })
+    # Data path picks up retrieved glossary + examples, then proceeds
+    # to SQL generation. The retry loop (validate → generate_sql) reuses
+    # the already-fetched context — no need to re-retrieve on retry.
+    g.add_edge("retrieve_context", "generate_sql")
     # Report path: plan_report → warmup_sql_cache → fan-out via Send →
     # parallel sub_query → aggregate_report. The warmup serializes a single
     # cache write so the parallel sub_queries that follow get cache READS

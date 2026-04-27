@@ -12,6 +12,7 @@ from agent.db import (
     run_query,
     vocabulary_string,
 )
+from agent.rag.retrieve import retrieve_context_block
 from agent.chart_directive import detect as detect_chart_directive
 from agent.prompts import (
     CHART_CODE_SYSTEM,
@@ -29,6 +30,7 @@ from agent.prompts import (
     REPORT_AGGREGATOR_USER,
     REPORT_PLANNER_SYSTEM,
     REPORT_PLANNER_USER,
+    RETRIEVED_CONTEXT_BLOCK,
     SECTION_SUMMARIZER_SYSTEM,
     SECTION_SUMMARIZER_USER,
     SQL_GENERATION_RETRY_HINT,
@@ -297,6 +299,45 @@ async def generate_response(state: AgentState) -> dict:
     }
 
 
+async def retrieve_context(state: AgentState) -> dict:
+    """Pull glossary + few-shot examples relevant to this question.
+
+    Runs once on the data path between front_agent and generate_sql. Result
+    lives in state.retrieved_context (markdown block injected into the SQL
+    user message) and state.retrieved_glossary/retrieved_examples (lightweight
+    {id, similarity} lists for UI observability — the Step renderer reads
+    these to show what was retrieved without dumping the full payload).
+
+    Failures are silent and degrade to no retrieval — the SQL generator
+    still works, just without question-specific grounding.
+    """
+    question = state.get("data_question") or state["question"]
+    block, glossary, examples = await asyncio.to_thread(
+        retrieve_context_block, question
+    )
+    return {
+        "retrieved_context": block or None,
+        "retrieved_glossary": [{"id": h["id"], "similarity": h["similarity"]} for h in glossary],
+        "retrieved_examples": [{"id": h["id"], "similarity": h["similarity"]} for h in examples],
+    }
+
+
+def _retrieved_block(state_or_text: AgentState | str | None) -> str:
+    """Format the retrieved-context block for splicing into SQL_GENERATION_USER.
+    Accepts either an AgentState (data path — reads from state.retrieved_context)
+    or a pre-resolved string (sub_query path — passes the block directly).
+    Returns empty string when there's nothing retrieved."""
+    if state_or_text is None:
+        return ""
+    if isinstance(state_or_text, str):
+        ctx = state_or_text
+    else:
+        ctx = state_or_text.get("retrieved_context") or ""
+    if not ctx.strip():
+        return ""
+    return RETRIEVED_CONTEXT_BLOCK.format(retrieved_context=ctx) + "\n\n"
+
+
 def generate_sql(state: AgentState) -> dict:
     question = state.get("data_question") or state["question"]
 
@@ -315,7 +356,11 @@ def generate_sql(state: AgentState) -> dict:
         vocabulary=vocabulary_string(),
         schema=pagila_schema_string(),
     )
-    user = SQL_GENERATION_USER.format(retry_context=retry_context, question=question)
+    user = SQL_GENERATION_USER.format(
+        retry_context=retry_context,
+        retrieved_block=_retrieved_block(state),
+        question=question,
+    )
 
     # System prompt (incl. ~6.7K-token schema) is fully stable across calls →
     # cache it. Variable retry context lives in the user message, uncached.
@@ -597,6 +642,7 @@ async def warmup_sql_cache(state: AgentState) -> dict:
     )
     usr_prompt = SQL_GENERATION_USER.format(
         retry_context="",
+        retrieved_block="",  # warmup is question-agnostic — no retrieval
         question="(cache warmup — produce any short valid SELECT)",
     )
     try:
@@ -687,6 +733,17 @@ async def sub_query(state: AgentState) -> dict:
     def _failed(msg: str) -> dict:
         return {"report_sections": [section.model_copy(update={"error": msg})]}
 
+    # 0. Retrieve per-section context. Each section asks a different
+    # sub-question, so each gets its own glossary + example hits. Failures
+    # degrade to no retrieval — the SQL generator falls through to its
+    # cached prompt path.
+    try:
+        retrieved_block_text, _, _ = await asyncio.to_thread(
+            retrieve_context_block, section.sub_question
+        )
+    except Exception:
+        retrieved_block_text = ""
+
     # 1. Generate SQL — uses _safe_invoke_in_thread so a stalled SDK call
     # in this branch can't block sibling sections indefinitely.
     try:
@@ -695,7 +752,11 @@ async def sub_query(state: AgentState) -> dict:
             vocabulary=vocabulary_string(),
             schema=pagila_schema_string(),
         )
-        usr_prompt = SQL_GENERATION_USER.format(retry_context="", question=section.sub_question)
+        usr_prompt = SQL_GENERATION_USER.format(
+            retry_context="",
+            retrieved_block=_retrieved_block(retrieved_block_text),
+            question=section.sub_question,
+        )
         sql_result: SQLGeneration = await _safe_invoke_in_thread(
             _sql_generator(),
             [_cached_system(sys_prompt), {"role": "user", "content": usr_prompt}],

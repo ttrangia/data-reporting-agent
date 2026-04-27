@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import time
 from dotenv import load_dotenv
 load_dotenv()  # must come before any imports that read env vars
 
@@ -52,20 +53,22 @@ def _format_rows_table(rows: list[dict]) -> str:
 #      If you skip this, the generic fallback renders the state-update fields
 #      as a key/value list — informative but unstyled.
 NODE_LABEL = {
-    "front_agent":      "Understanding the question",
-    "generate_sql":     "Generating SQL",
-    "validate_sql":     "Validating query",
-    "execute_sql":      "Executing on Postgres",
-    "diagnose_empty":   "Investigating empty result",
-    "generate_chart":   "Designing chart",
-    "plan_report":      "Planning report sections",
-    "warmup_sql_cache": "Warming SQL prompt cache",
-    "sub_query":        "Section query",
+    "front_agent":      "front agent",
+    "retrieve_context": "RAG retrieval",
+    "generate_sql":     "SQL generator",
+    "validate_sql":     "SQL validator",
+    "execute_sql":      "Postgres",
+    "diagnose_empty":   "empty-result diagnostic",
+    "generate_chart":   "chart designer",
+    "plan_report":      "report planner",
+    "warmup_sql_cache": "prompt-cache warmup",
+    "sub_query":        "section query",
     # aggregate_report is excluded — its prose IS the streaming message.
 }
 
 NODE_ICON = {
     "front_agent":      "brain",
+    "retrieve_context": "book-open",
     "generate_sql":     "code-2",
     "validate_sql":     "shield-check",
     "execute_sql":      "database",
@@ -75,6 +78,38 @@ NODE_ICON = {
     "warmup_sql_cache": "flame",
     "sub_query":        "file-search",
 }
+
+# How often to refresh elapsed time. 1s feels live without saturating the
+# Chainlit websocket — at 5+ parallel sub_query branches that's still <10
+# updates/sec total.
+TIMER_TICK_S = 1.0
+
+
+async def _step_timer(step: "cl.Step", base_label: str, started_at: float) -> None:
+    """Tick elapsed time into the step header until cancelled.
+
+    The "Using → Used" verb prefix is rendered by Chainlit itself based on
+    whether `step.end` is set. We only need to keep `step.end` cleared while
+    the node runs (it is, since we never set it on start) and append the
+    elapsed-time suffix to the name. on_chain_end will set step.end and
+    Chainlit's UI will flip the verb automatically.
+
+    Cancellation is normal control flow here, not an error.
+    """
+    try:
+        while True:
+            await asyncio.sleep(TIMER_TICK_S)
+            elapsed = time.perf_counter() - started_at
+            step.name = f"{base_label}  ·  {elapsed:.0f}s"
+            await step.update()
+    except asyncio.CancelledError:
+        pass
+
+
+def _utc_now_iso() -> str:
+    """Match Chainlit's internal utc_now format so the UI renders cleanly."""
+    from chainlit.utils import utc_now
+    return utc_now()
 
 
 def _step_body(node: str, output: dict) -> str:
@@ -112,6 +147,8 @@ def _step_body(node: str, output: dict) -> str:
         return _diagnose_step_body(output)
     if node == "generate_chart":
         return _chart_step_body(output.get("chart"))
+    if node == "retrieve_context":
+        return _retrieve_step_body(output)
     if node == "plan_report":
         return _plan_report_step_body(output)
     if node == "warmup_sql_cache":
@@ -124,6 +161,28 @@ def _step_body(node: str, output: dict) -> str:
         return _sub_query_step_body(output)
     # Fallback for any node added to NODE_LABEL without a custom branch above.
     return _generic_step_body(output)
+
+
+def _retrieve_step_body(output: dict) -> str:
+    """Step body for retrieve_context — list what was retrieved + scores
+    so the user can see *why* the SQL generator made certain choices."""
+    glossary = output.get("retrieved_glossary") or []
+    examples = output.get("retrieved_examples") or []
+    if not glossary and not examples:
+        return "_No relevant entries above the similarity threshold — using static prompt only._"
+    lines = []
+    if glossary:
+        lines.append(f"**Glossary** ({len(glossary)} hit{'s' if len(glossary) != 1 else ''}):")
+        for h in glossary:
+            sim = h.get("similarity") or 0.0
+            lines.append(f"- `{h['id']}` — sim {sim:.2f}")
+    if examples:
+        lines.append("")
+        lines.append(f"**Examples** ({len(examples)} hit{'s' if len(examples) != 1 else ''}):")
+        for h in examples:
+            sim = h.get("similarity") or 0.0
+            lines.append(f"- `{h['id']}` — sim {sim:.2f}")
+    return "\n".join(lines)
 
 
 def _plan_report_step_body(output: dict) -> str:
@@ -291,7 +350,9 @@ async def on_message(message: cl.Message):
         "run_name": f"chat:{(message.content or '')[:60]}",
     }
 
-    open_steps: dict[str, cl.Step] = {}
+    # Each entry tracks the cl.Step, the live-timer task that updates it
+    # while the node runs, and the start time for elapsed-time calculation.
+    open_steps: dict[str, dict] = {}
     final_answer = cl.Message(content="")
     summary_from_state: str | None = None
     rows_for_chart: list[dict] = []
@@ -364,13 +425,44 @@ async def on_message(message: cl.Message):
                     if icon:
                         step.icon = icon
                     step.show_input = False
+                    # Explicit start timestamp — without it Chainlit's
+                    # Using/Used renderer can't tell when the step
+                    # actually began and ends up showing stale state.
+                    step.start = _utc_now_iso()
                     await step.send()
-                    open_steps[run_id] = step
+                    # Kick off a live timer that ticks elapsed time into the
+                    # body so the user sees activity instead of an empty
+                    # collapsed dropdown. For sub_query branches, the verb
+                    # includes the section title so each parallel timer is
+                    # distinguishable.
+                    started_at = time.perf_counter()
+                    timer = asyncio.create_task(_step_timer(step, label, started_at))
+                    open_steps[run_id] = {
+                        "step": step,
+                        "timer": timer,
+                        "started_at": started_at,
+                        "base_label": label,
+                    }
 
                 elif kind == "on_chain_end" and run_id:
-                    step = open_steps.pop(run_id, None)
+                    entry = open_steps.pop(run_id, None)
                     output = ev["data"].get("output") or {}
-                    if step is not None:
+                    if entry is not None:
+                        # Stop the live timer, then overwrite the body with
+                        # the real node output + a footer showing how long
+                        # this node took.
+                        entry["timer"].cancel()
+                        try:
+                            await entry["timer"]
+                        except asyncio.CancelledError:
+                            pass
+                        elapsed = time.perf_counter() - entry["started_at"]
+                        step = entry["step"]
+                        # Setting step.end is the signal Chainlit's UI uses
+                        # to flip the verb prefix from "Using" to "Used".
+                        # The pinned elapsed-time suffix stays as-is.
+                        step.end = _utc_now_iso()
+                        step.name = f"{entry['base_label']}  ·  {elapsed:.0f}s"
                         step.output = _step_body(name, output)
                         await step.update()
                     if name == "front_agent":
@@ -405,9 +497,17 @@ async def on_message(message: cl.Message):
                     summary_from_state = output["summary"]
 
     except Exception as e:
-        for step in open_steps.values():
-            step.output = f"❌ Aborted: {type(e).__name__}"
-            await step.update()
+        # Cancel any still-ticking timers so they don't keep updating a
+        # step that's about to be overwritten with the error label.
+        for entry in open_steps.values():
+            entry["timer"].cancel()
+            try:
+                await entry["timer"]
+            except asyncio.CancelledError:
+                pass
+            entry["step"].end = _utc_now_iso()
+            entry["step"].output = f"❌ Aborted: {type(e).__name__}"
+            await entry["step"].update()
         await cl.Message(content=f"**Graph error:** `{type(e).__name__}: {e}`").send()
         return
 

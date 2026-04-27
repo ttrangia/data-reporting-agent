@@ -75,9 +75,21 @@ def admin_engine() -> Engine:
     return _make_engine(os.environ["DATABASE_URL_ADMIN"], readonly=False)
 
 
+# Agent infrastructure tables — physically present in the same Postgres
+# database as the user-facing data, but should NEVER be exposed to the
+# SQL generator or report planner. Including `rag_embeddings` here also
+# silences SQLAlchemy's "Did not recognize type 'vector'" warning (it
+# stops reflecting the column once the table is excluded).
+AGENT_INTERNAL_TABLES: frozenset[str] = frozenset({"rag_embeddings"})
+
+
 @cache
 def agent_db() -> SQLDatabase:
-    return SQLDatabase(engine=agent_engine(), sample_rows_in_table_info=3)
+    return SQLDatabase(
+        engine=agent_engine(),
+        sample_rows_in_table_info=3,
+        ignore_tables=list(AGENT_INTERNAL_TABLES),
+    )
 
 
 @cache
@@ -101,7 +113,7 @@ def pagila_table_index_string() -> str:
     def _load() -> str:
         from sqlalchemy import inspect
         insp = inspect(agent_engine())
-        tables = sorted(insp.get_table_names())
+        tables = sorted(t for t in insp.get_table_names() if t not in AGENT_INTERNAL_TABLES)
         lines = []
         for t in tables:
             cols = [c["name"] for c in insp.get_columns(t)]

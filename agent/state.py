@@ -59,6 +59,15 @@ class AgentState(TypedDict):
     # but here's what IS available" rather than a flat "no rows".
     diagnostic_sql: str | None
     diagnostic_rows: list[dict] | None
+    # RAG-retrieved glossary + few-shot example block, baked into the SQL
+    # generator's user prompt. None on respond/rechart paths (no SQL gen).
+    # Kept in the user message (not system) to preserve cache-prefix hits.
+    retrieved_context: str | None
+    # Lightweight observability metadata for the retrieve_context node.
+    # Lists of {id, similarity} so the Step body can show what was used
+    # without dumping the full payload (which is in retrieved_context).
+    retrieved_glossary: list[dict] | None
+    retrieved_examples: list[dict] | None
     # Report-mode fields. report_outline is the planner's blueprint;
     # report_sections accumulates one entry per parallel sub_query (custom
     # reducer to support reset-via-None); report_text is the final assembled
@@ -99,4 +108,9 @@ def turn_input(question: str, human_message: BaseMessage) -> dict:
         "report_sections": None,  # custom reducer interprets None as "reset to []"
         "report_text": None,
         "current_section": None,
+        # RAG retrieval is per-question — clear from prior turn so a follow-up
+        # gets fresh hits keyed off its own question text.
+        "retrieved_context": None,
+        "retrieved_glossary": None,
+        "retrieved_examples": None,
     }

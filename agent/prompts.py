@@ -161,7 +161,7 @@ Schema (DDL + 3 sample rows per table):
 Return your answer via the structured output schema: reasoning, tables_used, sql."""
 
 
-SQL_GENERATION_USER = """{retry_context}Question: {question}"""
+SQL_GENERATION_USER = """{retry_context}{retrieved_block}Question: {question}"""
 
 
 SQL_GENERATION_RETRY_HINT = """**Retry context — your previous attempt failed.**
@@ -413,6 +413,21 @@ Tables available (the SQL generator handles columns/types/joins downstream — y
 {table_index}
 
 Return a structured ReportPlan."""
+
+
+# Variable block injected by retrieve_context (data path) and inline in
+# sub_query (report path). Goes in the SQL generator's USER message so
+# the system prefix stays cacheable. Empty string when retrieval found
+# nothing relevant or the RAG layer is degraded.
+RETRIEVED_CONTEXT_BLOCK = """**Retrieved context for this specific question:**
+
+{retrieved_context}
+
+Use the conventions and example queries above when they apply — they
+encode dataset-specific decisions (canonical join paths, the SA/NZ
+store reality, default ranking metrics) that override generic SQL
+intuition. If a retrieved example exactly fits the user's question,
+adapt it rather than inventing from scratch."""
 
 
 REPORT_PLANNER_USER = """User asked: {question}
