@@ -20,12 +20,21 @@ from agent.nodes import (
     front_agent, retrieve_context, generate_sql, validate_sql,
     execute_sql, diagnose_empty, summarize, generate_chart,
     generate_response,
-    plan_report, warmup_sql_cache, sub_query, aggregate_report,
+    plan_report, warmup_sql_cache, dispatch_sections, sub_query,
+    aggregate_report,
     MAX_RETRIES,
 )
 
 
-def after_front(state: AgentState) -> str:
+def after_front(state: AgentState):
+    """Branch from front_agent.
+
+    Report intent fans out to TWO parallel nodes (plan_report + warmup_sql_
+    cache) by returning a list — LangGraph dispatches both concurrently and
+    they reconverge at dispatch_sections. Without this parallel split,
+    plan_report's ~3-15s would run sequentially before the 2-3s warmup,
+    adding the warmup time to the critical path on every report turn.
+    """
     intent = state["intent"]
     if intent == "data":
         # Data path goes through retrieve_context first so the SQL generator
@@ -33,7 +42,7 @@ def after_front(state: AgentState) -> str:
         # its user message.
         return "retrieve_context"
     if intent == "report":
-        return "plan_report"
+        return ["plan_report", "warmup_sql_cache"]
     # Deterministic safety refusal short-circuits with summary already set
     # in front_agent — skip generate_response, go straight to END.
     if state.get("summary"):
@@ -62,7 +71,13 @@ def after_generate_response(state: AgentState) -> str:
     return "END"  # respond
 
 
-def after_validate(state: AgentState) -> str:
+def after_validate(state: AgentState):
+    """Route after sql_guard runs.
+
+    Failure path is sequential (summarize alone) because there are no rows
+    to chart — generate_chart short-circuits to None anyway, but skipping
+    it removes an empty step from the UI.
+    """
     if state["sql_error"]:
         if state["retries"] >= MAX_RETRIES:
             return "summarize"
@@ -70,15 +85,24 @@ def after_validate(state: AgentState) -> str:
     return "execute_sql"
 
 
-def after_execute(state: AgentState) -> str:
+def after_execute(state: AgentState):
+    """Route after Postgres returns.
+
+    Success path with rows fans out to BOTH summarize and generate_chart in
+    parallel — they're independent (both read state.rows, neither needs
+    the other's output) and serializing them adds the chart picker's
+    4-8s of latency to the critical path on every data turn. Both nodes
+    flow to END; their state updates merge naturally.
+    """
     if state["sql_error"]:
         if state["retries"] >= MAX_RETRIES:
             return "summarize"
         return "generate_sql"
-    # Successful execute but 0 rows → run diagnostic before summarizing
+    # Successful execute but 0 rows → run diagnostic before summarizing.
+    # diagnose_empty also fans out to [summarize, generate_chart] downstream.
     if not state.get("rows"):
         return "diagnose_empty"
-    return "summarize"
+    return ["summarize", "generate_chart"]
 
 
 def build_graph():
@@ -95,6 +119,7 @@ def build_graph():
     # Report-mode nodes
     g.add_node("plan_report", plan_report)
     g.add_node("warmup_sql_cache", warmup_sql_cache)
+    g.add_node("dispatch_sections", dispatch_sections)
     g.add_node("sub_query", sub_query)
     g.add_node("aggregate_report", aggregate_report)
 
@@ -103,22 +128,24 @@ def build_graph():
         "retrieve_context":  "retrieve_context",
         "generate_response": "generate_response",
         "plan_report":       "plan_report",
+        "warmup_sql_cache":  "warmup_sql_cache",  # parallel sibling of plan_report
         "END":               END,
     })
     # Data path picks up retrieved glossary + examples, then proceeds
     # to SQL generation. The retry loop (validate → generate_sql) reuses
     # the already-fetched context — no need to re-retrieve on retry.
     g.add_edge("retrieve_context", "generate_sql")
-    # Report path: plan_report → warmup_sql_cache → fan-out via Send →
-    # parallel sub_query → aggregate_report. The warmup serializes a single
-    # cache write so the parallel sub_queries that follow get cache READS
-    # instead of all paying the write premium simultaneously (no-op if the
-    # cache is already warm from a previous report within ~5 minutes).
-    # LangGraph waits for all parallel sub_query branches to complete (the
-    # report_sections reducer accumulates their results) before firing
-    # aggregate_report.
-    g.add_edge("plan_report", "warmup_sql_cache")
-    g.add_conditional_edges("warmup_sql_cache", fan_out_sections, ["sub_query"])
+    # Report path: front_agent dispatches plan_report AND warmup_sql_cache
+    # in parallel (see after_front). They both flow into dispatch_sections,
+    # which is a no-op join that gates the fan-out — LangGraph waits for
+    # both incoming edges before firing dispatch_sections, so we know
+    # the outline is populated AND the prompt cache is warm before parallel
+    # sub_queries dispatch. Saves 2-3s of serial warmup time per report.
+    # After all sub_query branches complete, aggregate_report composes the
+    # final markdown.
+    g.add_edge("plan_report", "dispatch_sections")
+    g.add_edge("warmup_sql_cache", "dispatch_sections")
+    g.add_conditional_edges("dispatch_sections", fan_out_sections, ["sub_query"])
     g.add_edge("sub_query", "aggregate_report")
     g.add_edge("aggregate_report", END)
     g.add_conditional_edges("generate_response", after_generate_response, {
@@ -135,9 +162,19 @@ def build_graph():
         "generate_sql": "generate_sql",
         "diagnose_empty": "diagnose_empty",
         "summarize": "summarize",
+        "generate_chart": "generate_chart",  # parallel sibling of summarize
     })
+    # diagnose_empty fans out to summarize + generate_chart too. The chart
+    # node short-circuits to None when there are no rows, but running it
+    # in parallel keeps the data-turn topology uniform. (Pure no-op cost
+    # since generate_chart returns immediately on the empty-rows path.)
     g.add_edge("diagnose_empty", "summarize")
-    g.add_edge("summarize", "generate_chart")
+    g.add_edge("diagnose_empty", "generate_chart")
+    # Both summarize and generate_chart are leaf nodes. LangGraph waits for
+    # all in-flight branches to terminate before declaring the run complete,
+    # so the final state always has both `summary` and `chart` populated
+    # (or `chart=None` if the picker declined / there were no rows).
+    g.add_edge("summarize", END)
     g.add_edge("generate_chart", END)
 
     return g.compile(checkpointer=MemorySaver(serde=_checkpoint_serde))

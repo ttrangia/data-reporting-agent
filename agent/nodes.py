@@ -162,7 +162,7 @@ def _chart_picker():
 
 @cache
 def _report_planner():
-    return _make_llm("claude-sonnet-4-6").with_structured_output(ReportPlan)
+    return _make_llm("claude-haiku-4-5-20251001").with_structured_output(ReportPlan)
 
 
 @cache
@@ -619,6 +619,19 @@ REPORT_SECTION_ROW_BUDGET = 30   # rows shown to the section summarizer LLM
 REPORT_SECTION_CHART_ROW_BUDGET = 500  # rows persisted on the section for chart rendering
 
 
+async def dispatch_sections(state: AgentState) -> dict:
+    """Pass-through join node — gates the parallel fan-out to sub_query.
+
+    Has two upstream edges (plan_report and warmup_sql_cache) so LangGraph
+    waits for both to complete before this node runs. The fan_out_sections
+    conditional edge then fires from here. Without this join, fan-out
+    could fire from warmup_sql_cache before plan_report finished writing
+    `report_outline` — outline would be None and no sub_queries would
+    dispatch.
+    """
+    return {}
+
+
 async def warmup_sql_cache(state: AgentState) -> dict:
     """Pre-warm the SQL-generator's prompt cache before parallel fan-out.
 
@@ -780,7 +793,11 @@ async def sub_query(state: AgentState) -> dict:
     except Exception as e:
         return _failed(f"Execution failed: {type(e).__name__}: {str(e)[:200]}")
 
-    # 4. Section summary (1-2 sentences via Haiku, no streaming needed)
+    # 4 + 5. Section summary AND chart code in parallel.
+    # Neither depends on the other — both read `rows`, both are pure outputs
+    # of the section. Running them sequentially adds 3-5s per section to the
+    # critical path. asyncio.gather with return_exceptions=True ensures one
+    # failing doesn't tank the other.
     preview = rows[:REPORT_SECTION_ROW_BUDGET]
     summarizer_user = SECTION_SUMMARIZER_USER.format(
         title=section.title,
@@ -790,34 +807,40 @@ async def sub_query(state: AgentState) -> dict:
         shown_note=f", showing first {len(preview)}" if len(rows) > len(preview) else "",
         rows_preview=json.dumps(preview, default=str, indent=2),
     )
-    try:
-        summary_msg = await _safe_ainvoke(
+
+    async def _do_summary():
+        msg = await _safe_ainvoke(
             _section_summarizer(),
             [{"role": "system", "content": SECTION_SUMMARIZER_SYSTEM},
              {"role": "user", "content": summarizer_user}],
             op=f"sub_query.summarize[{section.title}]",
         )
-        section_summary = (
-            summary_msg.content if isinstance(summary_msg.content, str)
+        return (
+            msg.content if isinstance(msg.content, str)
             else "".join(
-                b.get("text", "") for b in summary_msg.content
+                b.get("text", "") for b in msg.content
                 if isinstance(b, dict) and b.get("type") in ("text", "text_delta")
             )
         )
-    except LLMTransportError as e:
-        section_summary = f"(summary unavailable: {e})"
-    except Exception as e:
-        section_summary = f"(summary unavailable: {type(e).__name__})"
 
-    # 5. Chart code (LLM call — also offloaded with the hard ceiling so it
-    # can't hold up the parallel branch indefinitely on a stalled SDK call).
-    try:
-        chart = await asyncio.wait_for(
+    async def _do_chart():
+        return await asyncio.wait_for(
             asyncio.to_thread(_section_chart, section, rows),
             timeout=LLM_HARD_TIMEOUT_S,
         )
-    except (asyncio.TimeoutError, Exception):
-        chart = None
+
+    summary_result, chart_result = await asyncio.gather(
+        _do_summary(), _do_chart(), return_exceptions=True,
+    )
+
+    if isinstance(summary_result, LLMTransportError):
+        section_summary = f"(summary unavailable: {summary_result})"
+    elif isinstance(summary_result, BaseException):
+        section_summary = f"(summary unavailable: {type(summary_result).__name__})"
+    else:
+        section_summary = summary_result
+
+    chart = None if isinstance(chart_result, BaseException) else chart_result
 
     completed = section.model_copy(update={
         "sql": canonical,
