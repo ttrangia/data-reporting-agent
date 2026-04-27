@@ -13,9 +13,6 @@ A natural-language reporting agent over a Postgres database, built with **LangGr
 *Multi-section report — parallel sub-queries fan out concurrently, compose into a single streamed markdown.*
 
 
-
-*Multi-section report — parallel sub-queries fan out concurrently, compose into a single streamed markdown.*
-
 The substrate is a Pagila DVD-rental sample database; the interesting work is the production scaffolding around it: routing, retries, RAG, sandboxed code exec, evals, prompt-cache optimization, and graceful degradation everywhere.
 
 ---
