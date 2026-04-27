@@ -177,7 +177,14 @@ def execute_chart_code(code: str, rows: list[dict]) -> go.Figure | None:
         return None
 
     df = pd.DataFrame(rows)
-    sandbox_globals: dict[str, Any] = {
+    # Single namespace dict — used as BOTH globals and (implicit) locals.
+    # If we pass separate globals and locals to exec(), Python writes
+    # top-level assignments into locals, but lambdas/comprehensions resolve
+    # names against globals only. So `xs = [...]` would be invisible to a
+    # subsequent `df.apply(lambda x: xs.index(x))`. Sharing the dict makes
+    # every name addressable from nested scopes — same semantics as a
+    # regular Python module's top level.
+    sandbox_ns: dict[str, Any] = {
         "__builtins__": ALLOWED_BUILTINS,
         "df": df,
         "pd": pd,
@@ -186,11 +193,10 @@ def execute_chart_code(code: str, rows: list[dict]) -> go.Figure | None:
         "np": np,
         "make_subplots": make_subplots,
     }
-    sandbox_locals: dict[str, Any] = {}
 
     def _run():
-        exec(compiled, sandbox_globals, sandbox_locals)
-        return sandbox_locals.get("fig", sandbox_globals.get("fig"))
+        exec(compiled, sandbox_ns)
+        return sandbox_ns.get("fig")
 
     try:
         fig = _executor.submit(_run).result(timeout=SANDBOX_TIMEOUT_SECONDS)

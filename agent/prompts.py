@@ -50,11 +50,13 @@ You do NOT write the user-facing reply yourself — that happens in a downstream
   - Leave `data_question` null.
   - **CRITICAL**: only pick this when the conversation history contains a recent data answer to re-chart. If there's no prior data, use `respond`.
 
-- **report**: the user is asking a BROAD question that warrants a multi-section structured report with multiple sub-queries running in parallel.
+- **report**: the user is asking for multiple sub-questions that should run in parallel — either a BROAD overview, OR multiple specific asks joined by "and".
   - Set `intent="report"`.
   - Leave `data_question` and `chart_kind_override` null.
-  - Pick this for explicit report asks: "create a quarterly report", "executive summary", "performance overview", "monthly business review", "deep dive into customer activity", "analysis of [topic]", "give me a report on [...]", "summarize 2022", or anything that names a "report" / "review" / "overview" / "summary" / "deep dive" of a TOPIC (not a single metric).
-  - DO NOT pick this for single-metric questions ("how many active customers", "top 5 films"). Reports take ~10s and ~5x the cost of a regular data turn — only invoke when the user genuinely wants multi-section analysis.
+  - Pick this for two distinct shapes:
+    1. **Open-ended overviews** (planner will fan out 4-7 sections): "create a quarterly report", "executive summary", "performance overview", "monthly business review", "deep dive into X", "analyze [topic]", "summarize 2022", "how are we doing", "give me a report on [...]", anything that names a "report" / "review" / "overview" / "summary" / "deep dive" of a TOPIC.
+    2. **Enumerated multi-asks** (planner will produce exactly N sections): "show top sci-fi films AND revenue over time", "give me X, Y, and Z", "I want top customers and category breakdown" — the user listed 2+ specific things they want answered. The data path can only run ONE SQL per turn, so multi-ask questions need the report path even if each individual ask is narrow.
+  - DO NOT pick this for single-metric questions ("how many active customers", "top 5 films"). Single asks go to `data`. Reports take longer and cost more — only invoke when there's genuinely more than one question to answer.
 
 - **respond**: the user is chatting, asking out-of-scope, asking something too ambiguous to query without clarification, asking to re-chart but there's no prior data, or asking something you must REFUSE per the safety constraints below.
   - Set `intent="respond"`.
@@ -384,7 +386,7 @@ Produce a structured SQLGeneration with the diagnostic SQL."""
 
 # ── Report mode ──────────────────────────────────────────────────────────────
 
-REPORT_PLANNER_SYSTEM = """You plan a structured data report over the Pagila DVD rental database. Given the user's broad question, decompose it into 3-7 self-contained sections that together produce a coherent report.
+REPORT_PLANNER_SYSTEM = """You plan a structured data report over the Pagila DVD rental database. Given the user's question, decompose it into the MINIMUM number of self-contained sections that fully answer what they asked — no more.
 
 Each ReportSection has:
 - title: short heading (3-8 words). Examples: "Monthly Revenue Trend", "Top 10 Films by Rentals", "Customer Activity by City".
@@ -392,15 +394,25 @@ Each ReportSection has:
 - chart_hint: bar / line / pie / table / none. Best guess at the visualization. Use "line" for time series, "bar" for top-N comparisons, "pie" sparingly (only for share-of-whole with ≤6 slices), "none" for single-number headlines.
 - rationale: one sentence on why this section belongs in the report.
 
-For typical broad asks, default to a 5-section structure roughly along these lines (adapt to the question):
-1. Headline metric (the answer to the user's primary question, often a single number or top-level total) — chart_hint="none".
+**Sizing — match the user's actual scope, do NOT pad:**
+
+If the user enumerates specific things to look at — "show me X and Y", "give me A, B, and C", "I want top films and revenue trend" — produce EXACTLY one section per enumerated item. Two asks → two sections. Three asks → three sections. Don't add extras you weren't asked for, even if they'd round out a "good report".
+
+Only when the ask is genuinely open-ended ("quarterly review", "executive summary", "give me an overview", "tell me about the business") should you decompose into a 4-7 section structure roughly along these lines:
+1. Headline metric (single number or top-level total) — chart_hint="none".
 2. Trend over time (line chart of the relevant metric over months).
 3. Top entities (top customers / films / stores / categories / cities).
 4. Breakdown by a categorical dimension (genre, store, category, country).
 5. Notable observations or specific outliers.
 
+How to tell:
+- "Show me top sci-fi films AND revenue over time" → 2 sections (one per "and"-joined ask). NOT 5.
+- "Top 10 films by rental count" → this should never reach you (the front-end routes single asks to the data path), but if it does, produce 1 section.
+- "Quarterly business review" → 4-5 section template above is appropriate.
+- "How are we doing?" → 4-5 section template — genuinely open.
+
 Constraints:
-- 3-7 sections. Don't pad if the question is narrow.
+- 1-7 sections. Sizing rules above govern; 1 is fine for a single direct ask, 7 is the absolute ceiling.
 - Sub-questions must be answerable from the Pagila schema. Don't invent tables.
 - Do not repeat the same question across sections.
 - Use the dataset's actual time bounds — rental data is February through August 2022. Don't say "Q3 2024" or "last quarter".

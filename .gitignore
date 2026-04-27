@@ -8,3 +8,4 @@ smoketest.py
 .DS_Store
 .claude/
 .pytest_cache/
+.env.bak

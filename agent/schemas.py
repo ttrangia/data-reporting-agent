@@ -86,7 +86,7 @@ class ReportSection(BaseModel):
 
 class ReportPlan(BaseModel):
     """Output of plan_report — decomposes a broad question into ordered sections."""
-    sections: list[ReportSection] = Field(min_length=2, max_length=7)
+    sections: list[ReportSection] = Field(min_length=1, max_length=7)
     rationale: str = Field(
         description=(
             "One sentence: what overall question this report answers and "
