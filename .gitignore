@@ -9,3 +9,4 @@ smoketest.py
 .claude/
 .pytest_cache/
 .env.bak
+BLOG.md
