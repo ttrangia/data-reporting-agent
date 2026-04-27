@@ -4,11 +4,15 @@ A natural-language reporting agent over a Postgres database, built with **LangGr
 
 **Live demo:** [pagila.tinotrangia.com](https://pagila.tinotrangia.com) — DM for credentials.
 
-<video src="docs/demos/hero1.mp4" autoplay loop muted playsinline width="720"></video>
+<https://github.com/user-attachments/assets/355aad09-7d7c-4c9f-869f-6db8b9ce7702>
 
 *Single-question flow — pipeline steps light up live, prose streams in, chart renders alongside.*
 
-<video src="docs/demos/hero2.mp4" autoplay loop muted playsinline width="720"></video>
+<https://github.com/user-attachments/assets/160aebd5-c930-49bd-b0e2-e71f199b142d>
+
+*Multi-section report — parallel sub-queries fan out concurrently, compose into a single streamed markdown.*
+
+
 
 *Multi-section report — parallel sub-queries fan out concurrently, compose into a single streamed markdown.*
 
