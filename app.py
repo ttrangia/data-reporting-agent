@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import logging
 import os
 import time
@@ -18,6 +19,39 @@ from agent.chart_sandbox import SandboxError, execute_chart_code
 from agent.state import ChartCode, turn_input
 
 warmup()
+
+
+# ─── Auth ─────────────────────────────────────────────────────────────────
+# Simple shared-credential password auth. Configure via env:
+#   CHAINLIT_AUTH_SECRET — random string for cookie signing (required by
+#                          Chainlit when ANY auth is enabled). Generate
+#                          with `chainlit create-secret` or `python -c
+#                          'import secrets; print(secrets.token_urlsafe(32))'`.
+#   APP_USERNAME, APP_PASSWORD — the credentials users enter at the login
+#                                screen. Both required; if either is unset
+#                                the callback rejects everything (deny by
+#                                default — never run with a missing
+#                                credential silently letting people in).
+#
+# This is one shared credential, not a per-user system. Right level of
+# friction for a portfolio piece: enough to keep web crawlers out and
+# prevent random API-cost burn, low enough that a recruiter can DM you
+# for the password and try it. Upgrade to OAuth later if you want.
+
+@cl.password_auth_callback
+def _auth_callback(username: str, password: str):
+    expected_user = os.getenv("APP_USERNAME") or ""
+    expected_pass = os.getenv("APP_PASSWORD") or ""
+    # Reject everyone if credentials aren't configured. Better than
+    # accidentally deploying with empty-string defaults that anyone could match.
+    if not expected_user or not expected_pass:
+        logger.warning("APP_USERNAME / APP_PASSWORD not set — rejecting all logins.")
+        return None
+    # Constant-time comparison so an attacker can't time-attack the password.
+    if (hmac.compare_digest(username, expected_user)
+            and hmac.compare_digest(password, expected_pass)):
+        return cl.User(identifier=username, metadata={"role": "user"})
+    return None
 
 
 # Anthropic emits multi-character chunks per stream event. Pacing the

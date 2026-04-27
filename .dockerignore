@@ -1,0 +1,50 @@
+# Keep the build context small + the image clean.
+# Anything listed here won't be copied into the image, even if a COPY line
+# would otherwise grab it.
+
+# Python venv + bytecode
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets — NEVER bake into the image. Inject via the platform's env
+# variable mechanism (Railway dashboard, Fly secrets, etc.).
+.env
+.env.local
+.env.*.local
+
+# Local-dev artifacts
+.chainlit/
+chainlit.db
+.files/
+public/
+
+# Eval reports — generated artifacts; not needed in prod
+evals/reports/
+
+# Tools that are dev-time only (token measurement, cache verification)
+tools/
+
+# Tests don't need to ship in the runtime image
+tests/
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Git / docs not needed in the running container
+.git/
+.github/
+.gitignore
+.gitattributes
+README.md
+*.md
+!chainlit.md  # except the Chainlit welcome screen, which it reads at boot
