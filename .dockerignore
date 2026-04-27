@@ -23,7 +23,8 @@ __pycache__/
 .chainlit/
 chainlit.db
 .files/
-public/
+# public/ holds starter icons + assets Chainlit serves at runtime — must
+# ship in the image.
 
 # Eval reports — generated artifacts; not needed in prod
 evals/reports/

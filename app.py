@@ -365,10 +365,78 @@ def _extract_text(chunk_content) -> str:
 
 @cl.on_chat_start
 async def on_chat_start():
+    # No auto-message here. Chainlit shows the chat profile's
+    # markdown_description + the starters from @cl.set_starters until the
+    # user sends their first message. Sending a bot message here would skip
+    # past that screen.
     cl.user_session.set("thread_id", cl.context.session.id)
-    await cl.Message(
-        content="Ready. Ask me anything about the Pagila database (DVD rental store, 2022 data)."
-    ).send()
+
+
+@cl.set_chat_profiles
+async def chat_profiles():
+    """Single profile used to render descriptive content on the welcome screen.
+
+    With exactly one profile defined, Chainlit hides the profile selector
+    and renders this profile's `markdown_description` above the starter
+    bubbles. That gives us a place to put framing text — what the agent
+    is, what it can do, the safety boundary — without needing custom CSS
+    or sending a bot message that would suppress the starters.
+    """
+    return [
+        cl.ChatProfile(
+            name="Pagila reporting agent",
+            markdown_description=(
+                "**Natural-language reporting** over the Pagila DVD-rental "
+                "database (Feb–Aug 2022). Ask anything you'd ask a data "
+                "analyst:\n\n"
+                "- **Single questions** → one SQL query + a chart when it fits\n"
+                "- **Multi-part asks** → parallel sub-queries composed into a "
+                "tight report\n"
+                "- **Open-ended overviews** → multi-section reports with "
+                "trends, top entities, and breakdowns\n"
+                "- **Follow-ups** like *\"show that as a pie chart\"* reuse the "
+                "prior result\n\n"
+                "Pick an example below or type your own."
+            ),
+            icon="/public/icons/avatar.svg",
+            default=True,
+        ),
+    ]
+
+
+@cl.set_starters
+async def set_starters():
+    """Example-question bubbles shown on the welcome screen.
+
+    Picked to demonstrate each major intent path of the agent:
+      - simple data question (single SQL pipeline)
+      - multi-ask report (parallel sub-queries, tight 2-section plan)
+      - dataset-quirk question (showcases RAG + dataset_notes awareness)
+      - open-ended report (4-5 section overview)
+    Click → message is sent as the user's first turn, identical to typing it.
+    """
+    return [
+        cl.Starter(
+            label="Top films of 2022",
+            message="What were the top 5 films by rental count in 2022?",
+            icon="/public/icons/film.svg",
+        ),
+        cl.Starter(
+            label="Revenue trend + top genres",
+            message="Show monthly revenue across 2022 and the top film categories by rental count.",
+            icon="/public/icons/trend.svg",
+        ),
+        cl.Starter(
+            label="Where do our customers live?",
+            message="Break down revenue by the country where customers live.",
+            icon="/public/icons/globe.svg",
+        ),
+        cl.Starter(
+            label="Quarterly business review",
+            message="Create a quarterly business review for 2022.",
+            icon="/public/icons/report.svg",
+        ),
+    ]
 
 
 @cl.on_message

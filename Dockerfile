@@ -31,6 +31,7 @@ RUN pip install -r requirements.txt
 
 # App code last so iteration on code is fast.
 COPY agent/ ./agent/
+COPY public/ ./public/
 COPY app.py chainlit.md ./
 
 # Railway / Fly / similar PaaS inject $PORT at runtime — never hardcode.

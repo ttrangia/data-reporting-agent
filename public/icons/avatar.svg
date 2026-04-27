@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- Circular tinted background — pre-clips to round so Chainlit's
+       avatar mask doesn't crop any corners. -->
+  <circle cx="12" cy="12" r="12" fill="#2563eb"/>
+  <!-- Centered bar-chart symbol with comfortable padding from the edge.
+       White stroke reads cleanly on the colored background. -->
+  <g fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <line x1="8.5" y1="16" x2="8.5" y2="13"/>
+    <line x1="12"  y1="16" x2="12"  y2="9.5"/>
+    <line x1="15.5" y1="16" x2="15.5" y2="11"/>
+    <line x1="7" y1="17.5" x2="17" y2="17.5"/>
+  </g>
+</svg>
